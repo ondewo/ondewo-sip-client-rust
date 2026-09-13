@@ -2,7 +2,7 @@
 
 *****************
 
-## Release ONDEWO SIP Rust Client 0.1.0
+## Release ONDEWO SIP Rust Client 5.4.0
 
 ### New Features
 
@@ -21,5 +21,16 @@
 * `make build` runs the whole pipeline - submodule checkout, compiler image build, stub
   generation and `cargo build` - and `make check_build` asserts that a generated stub exists for
   every proto package before a release is cut.
+* The generated stubs are COMMITTED under `src/api`, so the crate compiles straight from a
+  checkout - no docker, no compiler image and no submodule are needed to build or test it.
+  Regenerating them stays a `make build` concern.
+* A hand-written `auth` module (`ondewo_sip_client::auth::BearerTokenInterceptor`) attaches the
+  Keycloak `authorization: Bearer <token>` and `cai-token` metadata to every outgoing request.
+  Its `Debug` output redacts both credentials. `examples/authenticated_client.rs` shows the flow.
+* An integration suite under `tests/` exercises the generated code: wire-level encode/parse
+  round trips over the prost messages, pinned enum discriminants, and the generated
+  `SipServer` served over a loopback socket and driven by the generated `SipClient`, so
+  every declared RPC is really routed by its `/ondewo.sip.Sip/<Method>` path. `make coverage`
+  gates the hand-written sources at 100% line coverage, as does CI.
 
 *****************
