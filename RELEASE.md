@@ -2,6 +2,47 @@
 
 *****************
 
+## Release ONDEWO SIP Rust Client 5.5.0
+
+### New Features
+
+* Tracking API Version [5.5.0](https://github.com/ondewo/ondewo-sip-api/releases/tag/5.5.0)
+  (5.4.0 before). The regenerated stubs under `src/api` expose the new API surface:
+  * Answering machine detection: status `OUTGOING_CALL_ANSWERING_MACHINE_DETECTED = 22`,
+    `AnsweringMachineDetectionResult`, `SipStatus.amd_result`, `SipEndCallRequest.end_reason`
+    (`ANSWERING_MACHINE`, `ANSWERING_MACHINE_VOICE_MESSAGE_LEFT`, `TRANSFERRED`) and
+    `SipEndCallRequest.amd_result`, and the RPC `SipReportAnsweringMachineDetected`.
+  * Call identity: `SipStatus.call_id`. A request is scoped to a call with the
+    `x-ondewo-expected-call-id` gRPC metadatum (set it on the `tonic::Request`).
+  * `SipSetCallMediaControl`: call-scoped media control of the bot (`MediaControlSetting`,
+    `MediaControlOwner`, `participants_present`), reported in `SipStatus.bot_muted` and
+    `SipStatus.listening_paused`.
+  * `SipStreamCallAudio`: bidirectional live call audio (`SipCallAudioRequest` /
+    `SipCallAudioResponse` and their config, frame, started, stats and ended messages), counted
+    in `SipStatus.call_audio_streams`.
+  * Transfers with an outcome: `SipTransferCallRequest.outcome_timeout_ms` and
+    `SipStatus.sip_response_code`.
+* The API marks `SipGetSipStatus` and `SipGetSipStatusHistory` `idempotency_level =
+  NO_SIDE_EFFECTS`. The generated tonic client carries no retry policy, so this crate's behaviour
+  is unchanged.
+* The change is additive: no field, enum value or RPC was renumbered or removed. Rust code that
+  builds `SipStatus`, `SipEndCallRequest` or `SipTransferCallRequest` with a struct literal needs
+  `..Default::default()` for the new fields.
+
+### Tests
+
+* `tests/generated_grpc.rs` serves and calls the three new RPCs, incl. a real bidirectional
+  `SipStreamCallAudio` stream, an answering machine detection result round trip and the
+  `x-ondewo-expected-call-id` metadatum reaching the server.
+* `tests/generated_messages.rs` round-trips the new `SipStatus` fields, pins the new enum
+  discriminants and checks that a `oneof` keeps the variant that was set.
+
+### Build
+
+* `ondewo-proto-compiler` is pinned to 5.15.5 (5.15.4 before).
+
+*****************
+
 ## Release ONDEWO SIP Rust Client 5.4.1
 
 ### New Features

@@ -317,6 +317,81 @@ pub mod sip_client {
             req.extensions_mut().insert(GrpcMethod::new("ondewo.sip.Sip", "SipUnMute"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn sip_report_answering_machine_detected(
+            &mut self,
+            request: impl tonic::IntoRequest<
+                super::SipReportAnsweringMachineDetectedRequest,
+            >,
+        ) -> std::result::Result<tonic::Response<super::SipStatus>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ondewo.sip.Sip/SipReportAnsweringMachineDetected",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "ondewo.sip.Sip",
+                        "SipReportAnsweringMachineDetected",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn sip_set_call_media_control(
+            &mut self,
+            request: impl tonic::IntoRequest<super::SipSetCallMediaControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::SipStatus>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ondewo.sip.Sip/SipSetCallMediaControl",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("ondewo.sip.Sip", "SipSetCallMediaControl"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn sip_stream_call_audio(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::SipCallAudioRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::SipCallAudioResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/ondewo.sip.Sip/SipStreamCallAudio",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("ondewo.sip.Sip", "SipStreamCallAudio"));
+            self.inner.streaming(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -379,6 +454,27 @@ pub mod sip_server {
             &self,
             request: tonic::Request<()>,
         ) -> std::result::Result<tonic::Response<super::SipStatus>, tonic::Status>;
+        async fn sip_report_answering_machine_detected(
+            &self,
+            request: tonic::Request<super::SipReportAnsweringMachineDetectedRequest>,
+        ) -> std::result::Result<tonic::Response<super::SipStatus>, tonic::Status>;
+        async fn sip_set_call_media_control(
+            &self,
+            request: tonic::Request<super::SipSetCallMediaControlRequest>,
+        ) -> std::result::Result<tonic::Response<super::SipStatus>, tonic::Status>;
+        /// Server streaming response type for the SipStreamCallAudio method.
+        type SipStreamCallAudioStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::SipCallAudioResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        async fn sip_stream_call_audio(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::SipCallAudioRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::SipStreamCallAudioStream>,
+            tonic::Status,
+        >;
     }
     #[derive(Debug)]
     pub struct SipServer<T> {
@@ -917,6 +1013,152 @@ pub mod sip_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ondewo.sip.Sip/SipReportAnsweringMachineDetected" => {
+                    #[allow(non_camel_case_types)]
+                    struct SipReportAnsweringMachineDetectedSvc<T: Sip>(pub Arc<T>);
+                    impl<
+                        T: Sip,
+                    > tonic::server::UnaryService<
+                        super::SipReportAnsweringMachineDetectedRequest,
+                    > for SipReportAnsweringMachineDetectedSvc<T> {
+                        type Response = super::SipStatus;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                super::SipReportAnsweringMachineDetectedRequest,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Sip>::sip_report_answering_machine_detected(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SipReportAnsweringMachineDetectedSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ondewo.sip.Sip/SipSetCallMediaControl" => {
+                    #[allow(non_camel_case_types)]
+                    struct SipSetCallMediaControlSvc<T: Sip>(pub Arc<T>);
+                    impl<
+                        T: Sip,
+                    > tonic::server::UnaryService<super::SipSetCallMediaControlRequest>
+                    for SipSetCallMediaControlSvc<T> {
+                        type Response = super::SipStatus;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::SipSetCallMediaControlRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Sip>::sip_set_call_media_control(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SipSetCallMediaControlSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/ondewo.sip.Sip/SipStreamCallAudio" => {
+                    #[allow(non_camel_case_types)]
+                    struct SipStreamCallAudioSvc<T: Sip>(pub Arc<T>);
+                    impl<
+                        T: Sip,
+                    > tonic::server::StreamingService<super::SipCallAudioRequest>
+                    for SipStreamCallAudioSvc<T> {
+                        type Response = super::SipCallAudioResponse;
+                        type ResponseStream = T::SipStreamCallAudioStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::SipCallAudioRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Sip>::sip_stream_call_audio(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = SipStreamCallAudioSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
