@@ -53,6 +53,18 @@ fn sample_status() -> sip::SipStatus {
         exception_name: String::new(),
         exception_traceback: String::new(),
         nlu_session_name: "projects/p/agent/sessions/s".to_string(),
+        amd_result: Some(sip::AnsweringMachineDetectionResult {
+            verdict: sip::answering_machine_detection_result::Verdict::Human as i32,
+            confidence: 0.5,
+            matched_cue_ids: vec!["hello".to_string()],
+            call_id: "call-1".to_string(),
+            ..Default::default()
+        }),
+        call_id: "call-1".to_string(),
+        bot_muted: true,
+        listening_paused: true,
+        call_audio_streams: 2,
+        sip_response_code: 202,
     }
 }
 
@@ -87,6 +99,12 @@ fn sip_status_survives_a_serialize_parse_round_trip() {
     assert_eq!(parsed.headers["X-Ondewo-Call"], "outbound");
     assert_eq!(parsed.headers["X-Ondewo-Agent"], "agent-7");
     assert_eq!(parsed.nlu_session_name, "projects/p/agent/sessions/s");
+    assert_eq!(parsed.amd_result.unwrap().matched_cue_ids, vec!["hello"]);
+    assert_eq!(parsed.call_id, "call-1");
+    assert!(parsed.bot_muted);
+    assert!(parsed.listening_paused);
+    assert_eq!(parsed.call_audio_streams, 2);
+    assert_eq!(parsed.sip_response_code, 202);
 }
 
 #[test]
@@ -231,4 +249,56 @@ fn a_repeated_bytes_field_keeps_its_element_boundaries() {
     assert_eq!(parsed.wav_files.len(), 3);
     assert_eq!(parsed.wav_files[1], Vec::<u8>::new());
     assert_eq!(parsed.wav_files[2], vec![0xFF, 0x00, 0xFF]);
+}
+
+/// The answering machine status was added with discriminant 22; a regenerated enum that shifted it
+/// would silently relabel every status the server sends.
+#[test]
+fn the_answering_machine_status_keeps_its_discriminant() {
+    use sip::sip_status::StatusType;
+
+    assert_eq!(StatusType::OutgoingCallAnsweringMachineDetected as i32, 22);
+    assert_eq!(
+        StatusType::from_str_name("OUTGOING_CALL_ANSWERING_MACHINE_DETECTED"),
+        Some(StatusType::OutgoingCallAnsweringMachineDetected)
+    );
+    assert_eq!(
+        sip::sip_end_call_request::EndCallReason::Transferred as i32,
+        3,
+        "END_CALL_REASON_TRANSFERRED"
+    );
+}
+
+/// A `oneof` is a rust enum inside an `Option`: exactly the variant that was set has to come back,
+/// carrying its payload, and an unset oneof has to stay `None`.
+#[test]
+fn a_oneof_keeps_the_variant_that_was_set() {
+    use sip::sip_call_audio_request::Request;
+
+    let frame = sip::SipCallAudioRequest {
+        request: Some(Request::Audio(sip::SipCallAudioFrame {
+            pcm_s16le: vec![0x00, 0x80],
+            sequence: 7,
+        })),
+    };
+    let parsed = sip::SipCallAudioRequest::decode(frame.encode_to_vec().as_slice()).unwrap();
+    assert_eq!(parsed, frame);
+
+    // A bool variant set to `false` is still SET: a oneof member has presence.
+    let unmuted = sip::SipCallAudioRequest {
+        request: Some(Request::AgentMuted(false)),
+    };
+    let bytes = unmuted.encode_to_vec();
+    assert!(!bytes.is_empty(), "a set oneof member must reach the wire");
+    assert_eq!(
+        sip::SipCallAudioRequest::decode(bytes.as_slice())
+            .unwrap()
+            .request,
+        Some(Request::AgentMuted(false))
+    );
+
+    assert_eq!(
+        sip::SipCallAudioRequest::decode(&[][..]).unwrap().request,
+        None
+    );
 }
