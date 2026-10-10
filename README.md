@@ -47,7 +47,7 @@ or declare it in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ondewo-sip-client = "5.4"
+ondewo-sip-client = "5.5"
 tonic = "0.14"
 tokio = { version = "1", features = ["full"] }
 ```
