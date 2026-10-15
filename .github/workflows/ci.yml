@@ -1,13 +1,15 @@
 name: ci
 
 # The generated stubs under src/api are COMMITTED, so CI compiles and tests the crate straight
-# from the checkout: it needs neither docker, nor the ondewo-rust-proto-compiler image, nor the
-# ondewo-sip-api submodule. Regenerating the stubs is an integration concern - run `make build`
-# locally. Every step below therefore runs unconditionally: nothing here is allowed to skip
-# itself into a green run, and the first job asserts the stubs are actually present.
+# from the checkout: it needs neither docker nor the ondewo-rust-proto-compiler image. The
+# ondewo-sip-api submodule IS checked out, because tests/api_surface.rs compares the committed
+# stubs with the protos they were generated from. Regenerating the stubs is an integration
+# concern - run `make build` locally. Every step below runs unconditionally: nothing here is
+# allowed to skip itself into a green run, and the first job asserts the stubs are present.
 on:
   push:
     branches: ["**"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
   pull_request:
 
 # The default GITHUB_TOKEN is read-write; nothing in this workflow writes to the repository, so
@@ -32,9 +34,19 @@ env:
 jobs:
   build-and-test:
     name: build + test + publish dry run
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      # actions/checkout starts with a bare `git init`, and git >= 2.28 then prints a 13-line
+      # "Using 'master' as the name for the initial branch" hint into every job log. Naming the
+      # default up front is what silences it; master is this repository's default branch anyway.
+      - name: Name git's default branch
+        run: git config --global init.defaultBranch master
+
       - uses: actions/checkout@v7
+
+      # tests/api_surface.rs reads the protos at the pinned API commit.
+      - name: Check the ondewo-sip-api submodule out
+        run: git submodule update --init ondewo-sip-api
 
       # Fail loudly rather than compile an empty crate: without this, a lost or unmerged src/api
       # turns every step below into a no-op that still exits 0.
@@ -73,16 +85,16 @@ jobs:
           find src tests examples -name '*.rs' -not -path 'src/api/*' -exec rustfmt --check --edition 2021 {} +
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       # --all-targets also compiles examples/, which carry the crate's usage snippets.
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
       # The generated doc comments carry raw URLs and raw HTML from the proto comments; the
       # crate-level allows in src/lib.rs are what keep this green.
       - name: Build the documentation
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --locked
 
       # The credential-free half of the crates.io release, run on every push so the packaging path
       # can never rot unnoticed between releases: the manifest fields crates.io demands, the exact
@@ -96,9 +108,19 @@ jobs:
 
   coverage:
     name: coverage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      # actions/checkout starts with a bare `git init`, and git >= 2.28 then prints a 13-line
+      # "Using 'master' as the name for the initial branch" hint into every job log. Naming the
+      # default up front is what silences it; master is this repository's default branch anyway.
+      - name: Name git's default branch
+        run: git config --global init.defaultBranch master
+
       - uses: actions/checkout@v7
+
+      # tests/api_surface.rs reads the protos at the pinned API commit.
+      - name: Check the ondewo-sip-api submodule out
+        run: git submodule update --init ondewo-sip-api
 
       - name: Install the rust toolchain
         run: |
@@ -128,7 +150,7 @@ jobs:
         # a failing --fail-under-lines and report the step as green.
         shell: bash
         run: |
-          cargo llvm-cov --summary-only \
+          cargo llvm-cov --locked --summary-only \
             --ignore-filename-regex "$COVERAGE_EXCLUDE_REGEX" \
             --fail-under-lines "$COVERAGE_MIN_LINES" \
             | tee coverage-summary.txt
@@ -144,12 +166,18 @@ jobs:
       # records how much of them the suite touches, without gating on it.
       - name: Report the coverage of the generated stubs (not gated)
         run: |
-          cargo llvm-cov --summary-only --no-run --ignore-filename-regex '(^|/)(tests/|examples/)'
+          cargo llvm-cov report --summary-only --ignore-filename-regex '(^|/)(tests/|examples/)'
 
   lint:
     name: pre-commit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      # actions/checkout starts with a bare `git init`, and git >= 2.28 then prints a 13-line
+      # "Using 'master' as the name for the initial branch" hint into every job log. Naming the
+      # default up front is what silences it; master is this repository's default branch anyway.
+      - name: Name git's default branch
+        run: git config --global init.defaultBranch master
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v7
@@ -158,5 +186,15 @@ jobs:
 
       # markdownlint-cli2 + the hygiene hooks from .pre-commit-config.yaml. The commit-msg
       # hooks (giticket, conventional-pre-commit) are not part of `run --all-files`.
+      # pre-commit itself rather than pre-commit/action, which pins actions/cache@v4 on Node.js 20.
+      - name: Install pre-commit
+        run: python -m pip install --disable-pip-version-check pre-commit==4.6.2
+
+      - name: Cache the pre-commit environments
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
       - name: Run the pre-commit hooks
-        uses: pre-commit/action@v3.0.1
+        run: pre-commit run --all-files --show-diff-on-failure --color=always

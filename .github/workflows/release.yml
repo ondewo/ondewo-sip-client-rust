@@ -32,9 +32,19 @@ env:
 jobs:
   publish-crates-io:
     name: publish to crates.io
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
+      # actions/checkout starts with a bare `git init`, and git >= 2.28 then prints a 13-line
+      # "Using 'master' as the name for the initial branch" hint into every job log. Naming the
+      # default up front is what silences it; master is this repository's default branch anyway.
+      - name: Name git's default branch
+        run: git config --global init.defaultBranch master
+
       - uses: actions/checkout@v7
+
+      # tests/api_surface.rs reads the protos at the pinned API commit.
+      - name: Check the ondewo-sip-api submodule out
+        run: git submodule update --init ondewo-sip-api
 
       # FIRST, before anything expensive. Without this the job would build for minutes and then
       # hand cargo an empty token, which comes back as an opaque 403 from crates.io. A missing

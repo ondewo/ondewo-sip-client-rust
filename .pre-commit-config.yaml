@@ -9,7 +9,7 @@
 # Never touch generated or vendored code. src/api is written by the ondewo-rust-proto-compiler
 # image on every `make generate_ondewo_protos`, so a hook that rewrote it would produce a diff
 # that the next generation silently throws away. The two submodules carry their own hooks.
-exclude: '(^|/)(target|crate-dist|\.proto-input)/|^src/api/|^ondewo-sip-api/|^ondewo-proto-compiler/'
+exclude: '(^|/)(target|crate-dist|\.proto-input|\.proto-output)/|^src/api/|^ondewo-sip-api/|^ondewo-proto-compiler/'
 
 fail_fast: false
 # "fail_fast: false" means pre-commit continues to run hooks after the first failure
@@ -17,7 +17,7 @@ fail_fast: false
 repos:
 
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.23.0
+    rev: v0.23.3
     hooks:
       - id: markdownlint-cli2
 
