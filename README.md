@@ -263,13 +263,19 @@ A failed handshake surfaces either from `connect()` as `ChannelError::Connect`, 
 ├── examples
 │   └── authenticated_client.rs   <----- the crate's usage snippet, compiled by `cargo test`
 ├── tests                     <----- integration tests over the generated stubs
+│   ├── common/mod.rs         <----- the API surface DERIVED from the stubs and the protos
+│   ├── api_surface.rs        <----- the committed stubs route exactly the rpcs the protos declare
 │   ├── auth_interceptor.rs
 │   ├── generated_grpc.rs
+│   ├── generated_grpc_new_services.rs
 │   ├── generated_messages.rs
-│   ├── release_notes.rs      <----- pins the RELEASE.md slice the GitHub release body is cut from
+│   ├── release_makefile_hygiene.rs  <----- credentials never reach an argv or a build step
+│   ├── release_notes.rs      <----- runs the RELEASE.md slice the GitHub release body is cut from
+│   ├── release_process.rs    <----- pins the order of `make release` and the credentials clone
 │   └── tls_channel.rs        <----- real TLS / mutual TLS handshakes with a test-time PKI
 ├── Cargo.toml                <----- crate manifest AND the generator's crate template
 ├── Cargo.lock
+├── Dockerfile.release-tools  <----- pinned gh + pre-commit, used only when the host lacks them
 ├── Makefile
 └── README.md
 ```
@@ -293,28 +299,31 @@ is the whole pipeline:
 1. `update_submodules` - `git submodule update --init --recursive`
 1. `checkout_defined_submodule_versions` - checks out the pins at the top of the `Makefile`
    (`ONDEWO_SIP_API_GIT_BRANCH` and `ONDEWO_PROTO_COMPILER_GIT_BRANCH`)
-1. `build_compiler` - builds `ondewo-rust-proto-compiler:latest` from the submodule
+1. `build_compiler` - builds `ondewo-rust-proto-compiler:<compiler version>` from the submodule
+   (tagged by version, never `latest`, so another product's release cannot swap the compiler)
 1. `update_cargo_version` - writes `ONDEWO_SIP_VERSION` into `Cargo.toml`
-1. `generate_ondewo_protos` - runs the image over `ondewo-sip-api/ondewo` and writes `src/api`,
-   `Cargo.toml`, `Cargo.lock` and `crate-dist/` back into this repository
+1. `generate_ondewo_protos` - runs the image over `ondewo-sip-api/ondewo`; it mounts only two
+   staging directories (`.proto-input/`, `.proto-output/`) and copies `src/api`, `Cargo.toml`,
+   `Cargo.lock` and `crate-dist/` back into this repository afterwards
 1. `check_build` - asserts that a generated stub exists for every proto package
 1. `cargo_build` - compiles the crate
 
 The image tag is the only contract between this repository and the compiler, so a compiler change
-can be tried out without touching the submodule pin: build the tag from a compiler working tree
-(`docker build -t ondewo-rust-proto-compiler:latest rust` in that repository) and run
-`make generate_ondewo_protos` here.
+can be tried out without touching the submodule pin: build any tag from a compiler working tree
+(`docker build -t ondewo-rust-proto-compiler:dev rust` in that repository) and run
+`make generate_ondewo_protos PROTO_COMPILER_IMAGE=ondewo-rust-proto-compiler:dev` here.
 
 `make help` lists every documented target.
 
 ## Testing and Linting
 
 ```bash
-make test              # cargo test --all-targets
+make test              # cargo test --all-targets --locked
 make coverage          # hand-written line coverage, gated at 100%
 make cargo_fmt_check   # rustfmt over the HAND-WRITTEN sources only
-make cargo_doc         # cargo doc --no-deps
+make cargo_doc         # cargo doc --no-deps --locked
 make precommit_hooks_run_all_files
+make release_tests     # all of the above but coverage, plus check_build and the packaging dry run
 ```
 
 The suite under `tests/` exercises the **generated** stubs the way a broken generator would be
@@ -325,8 +334,14 @@ the generated `SipServer` is served over a loopback socket and driven by the gen
 
 `tests/tls_channel.rs` runs real TLS and mutual TLS handshakes against an in-process tonic
 server, with a throw-away PKI that the `openssl` CLI generates at test time - it has to be on
-`PATH` (it is on GitHub's ubuntu runners). `tests/release_notes.rs` pins the `RELEASE.md` slice
-that the GitHub release body is cut from.
+`PATH` (it is on GitHub's ubuntu runners). `tests/release_notes.rs` runs the `RELEASE.md` slice
+that the GitHub release body is cut from through make and perl, so `make` and `perl` must be on
+`PATH` too.
+
+`tests/api_surface.rs` compares the committed stubs with the protos of the `ondewo-sip-api`
+submodule, so it needs that submodule checked out (`git submodule update --init ondewo-sip-api`;
+CI does it). The RPC sets the other tests compare against are DERIVED from the generated code -
+there is no hand-written count or list that a new API release would make stale.
 
 `make coverage` measures the **hand-written** sources only - `src/api`, `tests/` and `examples/`
 are excluded, because generated code is machine output rather than authored logic - and fails
@@ -342,40 +357,79 @@ hand-written usage snippet therefore lives in `examples/`, where `cargo test` st
 ## Release
 
 Releases are cut from the `Makefile`. Bump `ONDEWO_SIP_VERSION`, add the matching
-entry to `RELEASE.md`, then:
+`## Release ONDEWO SIP Rust Client <version>` section to `RELEASE.md`, then:
 
 ```bash
 make ondewo_release
 ```
 
-which checks that the release branch and tag do not exist yet (`spc`), pulls the credentials from
-the `ondewo-devops-accounts` repository and runs `make release` with them: build, commit, release
-branch, release tag and the GitHub release.
+The host needs only `docker`, `make`, `git`, `perl` and `curl`. `cargo`, `rustfmt`, `pre-commit`
+and `gh` are used from the host when present and otherwise run in pinned images: the official rust
+image (by version and digest) and `Dockerfile.release-tools` (gh by version and sha256, pre-commit
+by version), which is built only when needed and from stdin, without a build context.
+
+What happens, in order (`tests/release_process.rs` pins it):
+
+1. `spc` - the version must not exist yet: no `release/<version>` branch and no `<version>` tag,
+   on origin (`git ls-remote --exit-code`, exact ref names) or locally, and no
+   `ondewo-sip-client <version>` on crates.io.
+1. The credentials are read from the `ondewo-devops-accounts` repository - from
+   `DEVOPS_ACCOUNT_DIR` when the release driver hands in its own clone, otherwise from a fresh
+   clone in a `mktemp -d` directory outside this repository - and that clone is **deleted before
+   the release starts** (and on every failure, by a trap). The tokens live only in the
+   environment of that one shell.
+1. `release_preflight` (read-only, `make release_preflight` runs it alone): the host tools; `spc`;
+   a non-empty `RELEASE.md` section whose heading matches exactly (`9.1.1` never selects `9.1.10`);
+   `GITHUB_GH_TOKEN` can push to this repository (`gh api … --jq .permissions.push` is `true`); the
+   Actions secret `CARGO_REGISTRY_TOKEN` that the release workflow publishes with exists (GitHub
+   never reveals a secret's value, so this proves presence only); and the devops crates.io token
+   authenticates (`/api/v1/me` answers a live API token with *"this action can only be performed
+   on the crates.io website"* and a revoked one with *"authentication failed"* - it does not prove
+   the token's scopes). A failure here leaves no commit, branch, tag or package behind.
+1. `make build` and `make release_tests` - the whole suite: `cargo test --all-targets --locked`,
+   `check_build`, `cargo_fmt_check`, `cargo_doc`, `publish_crate_dry_run` and the pre-commit
+   hooks. Neither step sees a credential (`WITHOUT_CREDENTIALS`), so no token reaches cargo, a
+   build script, a test or a hook.
+1. The release commit (only when something is staged; a commit that fails stops the release),
+   `git push`, the `release/<version>` branch and the `<version>` tag.
+1. crates.io is published by `.github/workflows/release.yml`, which the tag push starts (see
+   below). `release_verify_crate` waits for that run with `gh run watch --exit-status` and then
+   polls `https://crates.io/api/v1/crates/ondewo-sip-client/<version>` until it serves the version
+   (20 x 30 s).
+1. The GitHub release, with the `RELEASE.md` section as its body, then `release_verify`: the tag is
+   on origin, the release body is non-empty and the crate is served. Only then does the recipe
+   print *Release Finished*.
+
+`gh` is authenticated per call with `GH_TOKEN`; nothing is ever written to `~/.config/gh`.
+`make release_verify` is read-only and can be run against any published version.
+`release_preflight` and `release_verify` also run on their own: with only an absolute
+`DEVOPS_ACCOUNT_DIR` set (as the ondewo-sip-api release driver calls them), each loads the tokens
+the environment lacks from that directory into its own shell, e.g.
+`make release_verify ONDEWO_SIP_VERSION=5.5.0 DEVOPS_ACCOUNT_DIR=/abs/path/to/ondewo-devops-accounts`.
 
 ### Publishing to crates.io
 
-The upload is **not** done by `make release`. Pushing the release tag starts
+The upload is **not** done on the release host. Pushing the release tag starts
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which asserts that the tag
 matches the version in `Cargo.toml` and that the generated stubs are committed, builds and tests
 the tagged commit, re-runs the packaging dry run and only then runs `make publish_crate` with the
 `CARGO_REGISTRY_TOKEN` repository secret. Keeping the single upload there is deliberate: a second
 publisher inside `make release` would race the workflow, and the loser would die on *crate version
-already uploaded*.
+already uploaded*. `make release` waits for that run, so a red run fails the release.
 
 The workflow refuses to start work when the secret is unset, rather than reaching the upload with
-an empty token, so a missing credential is a red run that names it and not a green run that
-published nothing. Two operator tasks are therefore one-time prerequisites:
+an empty token. Two operator tasks are therefore one-time prerequisites:
 
 * an API token from <https://crates.io/settings/tokens> with the **publish-new** and
   **publish-update** scopes, stored as the repository secret `CARGO_REGISTRY_TOKEN` under
   *Settings → Secrets and variables → Actions*,
-* the same token in `account_cargo.env` of the `ondewo-devops-accounts` repository, which is what
-  the manual fallback reads.
+* the same token in `account_cargo.env` of the `ondewo-devops-accounts` repository, which the
+  preflight probes and the manual fallback uploads with.
 
 That fallback is:
 
 ```bash
-make ondewo_publish_crate   # clones devops-accounts, runs publish_crate with the token from it
+make ondewo_publish_crate   # publish_crate with the token from devops-accounts (clone deleted first)
 ```
 
 Everything about the release except the upload itself is exercised without any credential, both
