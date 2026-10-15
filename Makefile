@@ -1,4 +1,3 @@
-export
 # =====================================================================================
 # ondewo-sip-client-rust - Makefile
 #
@@ -18,13 +17,15 @@ export
 # 1 - Update the version number (ONDEWO_SIP_VERSION below)
 # 2 - Update RELEASE.md
 # 3 - make build
-# -------------- Release Process Steps --------------
-# 1 - Get Credentials from devops-accounts repo
-# 2 - Create Release Branch and push
-# 3 - Create Release Tag and push
-# 4 - GitHub Release
-# 5 - crates.io Release - done by .github/workflows/release.yml, which the tag push in step 3
-#     triggers. `make ondewo_publish_crate` is the manual fallback.
+# -------------- Release Process Steps (make ondewo_release) --------------
+# 1 - spc: the version is neither a release branch / tag (origin and local) nor on crates.io
+# 2 - load the credentials from devops-accounts, then DELETE that clone before anything runs
+# 3 - release_preflight: host tools, spc, RELEASE.md section, credentials valid (read-only)
+# 4 - build + the whole test suite, without any credential in their environment
+# 5 - release commit, push, release branch, release tag
+# 6 - crates.io: .github/workflows/release.yml publishes from the tag; release_verify_crate waits
+#     for that run and for crates.io to serve the version
+# 7 - GitHub release, then release_verify (tag, non-empty release body, crate served)
 
 ########################################################
 # 		Variables
@@ -52,12 +53,51 @@ ONDEWO_PROTO_COMPILER_DIR=ondewo-proto-compiler
 #   <relative_protos_dir>   the protoc -I root every `import "x/y.proto";` resolves against
 #   <target_subdir>         the sub-directory whose protos are the compilation entry points;
 #                           google/ is pulled in only as a resolved dependency
-PROTO_COMPILER_IMAGE=ondewo-rust-proto-compiler:latest
+# The tag is the compiler VERSION, never `latest`: the sip/csi/sip clients pin different compiler
+# releases, and one shared `latest` tag lets one product's release overwrite another's compiler.
+# The submodule's build.sh hard-codes `:latest`, so build_compiler runs docker build itself.
+PROTO_COMPILER_VERSION=$(subst /,_,$(patsubst tags/%,%,${ONDEWO_PROTO_COMPILER_GIT_BRANCH}))
+PROTO_COMPILER_IMAGE=ondewo-rust-proto-compiler:${PROTO_COMPILER_VERSION}
 ONDEWO_PROTOS_DIR=${ONDEWO_SIP_API_DIR}
 ONDEWO_PROTOS_TARGET_DIR=ondewo
 
-# Staging directory that is handed to the image as /input-volume (see generate_ondewo_protos)
+# Staging directories handed to the image as /input-volume and /output-volume (see
+# generate_ondewo_protos). Neither is the repository root, so nothing else in the working tree is
+# ever mounted into the compiler container.
 PROTO_INPUT_DIR=.proto-input
+PROTO_OUTPUT_DIR=.proto-output
+
+# Host tools. A release needs only docker, make, git, perl and curl on the host; cargo, rustfmt,
+# pre-commit and gh are used from the host when present and otherwise run in pinned images:
+#   RUST_IMAGE                - the official rust image, by version AND digest
+#   Dockerfile.release-tools  - gh (pinned version, sha256-checked) + pre-commit (pinned), built
+#                               from stdin (no build context) and tagged by the Dockerfile's hash
+RUST_IMAGE=rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+RELEASE_TOOLS_IMAGE=ondewo-sip-client-rust-release-tools:$(shell sha256sum Dockerfile.release-tools 2>/dev/null | cut -c1-16)
+DOCKER_AS_ME=docker run --rm --user $(shell id -u):$(shell id -g) -e HOME=/tmp -v $(CURDIR):/work -w /work
+CARGO_IN_DOCKER=${DOCKER_AS_ME} -e CARGO_HOME=/work/target/docker-cargo-home ${RUST_IMAGE} cargo
+RUSTFMT_IN_DOCKER=${DOCKER_AS_ME} ${RUST_IMAGE} rustfmt
+PRE_COMMIT_IN_DOCKER=${DOCKER_AS_ME} -e PRE_COMMIT_HOME=/work/target/docker-pre-commit-home ${RELEASE_TOOLS_IMAGE} pre-commit
+# -i so `--notes-file -` can read the notes from stdin; -e GH_TOKEN forwards the variable by NAME,
+# so the token never reaches docker's argv.
+GH_IN_DOCKER=docker run --rm -i -e GH_TOKEN ${RELEASE_TOOLS_IMAGE} gh
+CARGO?=$(if $(shell command -v cargo 2>/dev/null),cargo,${CARGO_IN_DOCKER})
+RUSTFMT?=$(if $(shell command -v rustfmt 2>/dev/null),rustfmt,${RUSTFMT_IN_DOCKER})
+PRE_COMMIT?=$(if $(shell command -v pre-commit 2>/dev/null),pre-commit,${PRE_COMMIT_IN_DOCKER})
+GH?=$(if $(shell command -v gh 2>/dev/null),gh,${GH_IN_DOCKER})
+# publish_crate only: the one cargo invocation that may see the crates.io token (-e by NAME).
+CARGO_PUBLISH?=$(if $(shell command -v cargo 2>/dev/null),cargo,${DOCKER_AS_ME} -e CARGO_HOME=/work/target/docker-cargo-home -e CARGO_REGISTRY_TOKEN ${RUST_IMAGE} cargo)
+
+# The recipes that clone or load credentials start their sub-make through this alias rather than
+# through a literal $$(MAKE): GNU make EXECUTES a recipe line that references $$(MAKE) even under
+# `make -n`, so `make -n ondewo_release` would clone devops-accounts and load the credentials just
+# to show the plan. Referenced through another variable, the line is only printed.
+SUBMAKE=$(MAKE)
+
+# Build and test steps of a release run under this prefix, so the release credentials never reach
+# cargo, its build scripts, the test binaries, docker or the pre-commit hooks - only the gh / curl
+# steps that need a token see one.
+WITHOUT_CREDENTIALS=env -u GITHUB_GH_TOKEN -u CARGO_REGISTRY_TOKEN -u GH_TOKEN -u GITHUB_TOKEN
 
 # Coverage gate - KEEP IN SYNC with .github/workflows/ci.yml, which runs the same two values.
 # Excluded from the metric: the generated stubs (machine output, not authored logic) and the
@@ -68,23 +108,54 @@ COVERAGE_MIN_LINES=100
 # You need to setup an access token at https://github.com/settings/tokens - permissions are important
 GITHUB_GH_TOKEN?=ENTER_YOUR_TOKEN_HERE
 # You need to setup an API token at https://crates.io/settings/tokens, scoped to publish-new +
-# publish-update. `cargo publish` reads it from the environment (this Makefile `export`s every
-# variable), so it never appears on a command line and never reaches the build log.
+# publish-update. `cargo publish` reads it from the environment, so it never appears on a command
+# line and never reaches the build log.
 CARGO_REGISTRY_TOKEN?=ENTER_HERE_YOUR_CARGO_REGISTRY_TOKEN
+# This Makefile exports NOTHING by itself: a credential reaches a recipe only when it is in the
+# environment make was started with (ondewo_release puts it there), and recipes read it as $$NAME.
 
 # crates.io refuses an upload whose .crate tarball is larger than this (10 MiB, the default limit).
 # The check is server-side, so `cargo publish --dry-run` cannot catch it - publish_crate_dry_run does.
 CRATE_MAX_BYTES=10485760
 
-# Terminate on the ***** separator that delimits release entries, NOT on /\*\*/ - that matches the
-# first markdown **bold** span inside the entry and silently truncates the notes there, with no
-# error from `gh release create`.
-CURRENT_RELEASE_NOTES=`cat RELEASE.md \
-	| perl -ne 'print if /Release ONDEWO SIP Rust Client ${ONDEWO_SIP_VERSION}/../^\*{5}/'`
+# The release notes of ONDEWO_SIP_VERSION: from the heading that matches EXACTLY (anchored, the
+# version dots taken literally by \Q..\E, so 9.1.1 never matches 9.1.10) down to the next *****
+# separator, then stop - a later mention of the heading cannot restart the slice. Ending on
+# /\*\*/ instead would cut the notes at their first markdown **bold** span. \x23 is `#`, which make
+# would otherwise read as a comment.
+RELEASE_NOTES_FILE=RELEASE.md
+RELEASE_NOTES_HEADING=Release ONDEWO SIP Rust Client
+RELEASE_NOTES_SLICE=perl -ne '$$in = 1 if /^\x23+ ${RELEASE_NOTES_HEADING} \Q${ONDEWO_SIP_VERSION}\E$$/; if ($$in) { print; exit if /^\*{5}/ }' ${RELEASE_NOTES_FILE}
+CURRENT_RELEASE_NOTES=`${RELEASE_NOTES_SLICE}`
 
-GH_REPO="https://github.com/ondewo/ondewo-sip-client-rust"
-DEVOPS_ACCOUNT_GIT="ondewo-devops-accounts"
-DEVOPS_ACCOUNT_DIR="./${DEVOPS_ACCOUNT_GIT}"
+CRATE_NAME=ondewo-sip-client
+GH_REPO_SLUG=ondewo/ondewo-sip-client-rust
+GH_REPO="https://github.com/${GH_REPO_SLUG}"
+# crates.io's crawler policy requires a User-Agent that identifies the caller.
+CRATES_IO_USER_AGENT=ondewo-sip-client-rust-release (office@ondewo.com)
+CRATES_IO_VERSION_URL=https://crates.io/api/v1/crates/${CRATE_NAME}/${ONDEWO_SIP_VERSION}
+# release_verify polls the registry this often before it gives up (20 x 30 s = 10 minutes).
+VERIFY_ATTEMPTS=20
+VERIFY_INTERVAL_S=30
+
+DEVOPS_ACCOUNT_GIT=ondewo-devops-accounts
+DEVOPS_ACCOUNT_REPO=git@bitbucket.org:ondewo/${DEVOPS_ACCOUNT_GIT}.git
+# Set by the ondewo-sip-api release driver to its single temporary clone: when it names an
+# existing directory, ondewo_release reads the credentials from there and neither clones nor
+# deletes it (the driver owns it). Unset, ondewo_release clones into a fresh `mktemp -d` OUTSIDE
+# this repository and deletes that clone before the release starts.
+DEVOPS_ACCOUNT_DIR?=
+# The release driver also runs release_preflight and release_verify STANDALONE, with nothing but an
+# absolute DEVOPS_ACCOUNT_DIR set. Those two therefore load what they need from that directory -
+# each credential only when the environment does not already carry it (inside `make release` it
+# does) - into their own recipe shell: anchored grep, `set -a` + eval, so no value reaches an argv or
+# the log. A no-op when DEVOPS_ACCOUNT_DIR is unset or not a directory.
+LOAD_DEVOPS_CREDENTIALS=if [ -n "${DEVOPS_ACCOUNT_DIR}" ] && [ -d "${DEVOPS_ACCOUNT_DIR}" ]; then \
+		set -a; \
+		[ -n "$${GITHUB_GH_TOKEN:-}" ] || eval "`grep -h -E '^GITHUB_GH_TOKEN=' "${DEVOPS_ACCOUNT_DIR}/account_github.env" 2>/dev/null`"; \
+		[ -n "$${CARGO_REGISTRY_TOKEN:-}" ] || eval "`grep -h -E '^CARGO_REGISTRY_TOKEN=' "${DEVOPS_ACCOUNT_DIR}/account_cargo.env" 2>/dev/null`"; \
+		set +a; \
+	fi
 
 # Define colors globally (reused for [INFO]/[SUCCESS]/[WARN]/[ERROR] log lines in recipes)
 BLUE   := \033[1;34m
@@ -112,8 +183,8 @@ install_precommit_hooks: ## Installs pre-commit hooks and sets them up for the o
 	pre-commit install
 	pre-commit install --hook-type commit-msg
 
-precommit_hooks_run_all_files: ## Runs all pre-commit hooks on all files and not just the changed ones
-	pre-commit run --all-files
+precommit_hooks_run_all_files: release_tools_image ## Runs all pre-commit hooks on all files and not just the changed ones
+	${PRE_COMMIT} run --all-files
 
 help: ## Print usage info about help targets
 	# (first comment after target starting with double hashes ##)
@@ -153,7 +224,8 @@ build: update_submodules checkout_defined_submodule_versions build_compiler upda
 
 build_compiler: ## Build proto compiler docker image from the ondewo-proto-compiler submodule
 	@echo "$(BLUE)[INFO]$(NC) Building ${PROTO_COMPILER_IMAGE} from ${ONDEWO_PROTO_COMPILER_DIR}/rust ..."
-	cd ${ONDEWO_PROTO_COMPILER_DIR}/rust && sh build.sh
+# What the submodule's build.sh runs, but tagged with the compiler version instead of `latest`.
+	docker build --no-cache -t ${PROTO_COMPILER_IMAGE} ${ONDEWO_PROTO_COMPILER_DIR}/rust
 	@echo "$(GREEN)[SUCCESS]$(NC) Built ${PROTO_COMPILER_IMAGE}"
 
 generate_ondewo_protos: ## Generate rust code from proto files into src/api
@@ -177,49 +249,66 @@ generate_ondewo_protos: ## Generate rust code from proto files into src/api
 #  * --user, as in ondewo-proto-compiler/rust/Makefile, so the generated src/api,
 #    Cargo.toml, Cargo.lock and crate-dist/ are owned by the caller and not by root.
 #    The image chmods its working directories a+w so this works.
-# The output volume is the repository root, because the crate IS this repository.
+# The output volume is a staging directory, NOT the repository root: the root can hold anything
+# (a credentials clone, a stale target/), and none of it is the container's business. The image
+# writes src/, Cargo.toml, Cargo.lock and crate-dist/ there; they are copied back afterwards.
+	rm -rf ${PROTO_OUTPUT_DIR}
+	mkdir -p ${PROTO_OUTPUT_DIR}
 	docker run --rm \
 		--user ${shell id -u}:${shell id -g} \
-		-v ${shell pwd}/${PROTO_INPUT_DIR}:/input-volume \
-		-v ${shell pwd}:/output-volume \
+		-v ${CURDIR}/${PROTO_INPUT_DIR}:/input-volume \
+		-v ${CURDIR}/${PROTO_OUTPUT_DIR}:/output-volume \
 		${PROTO_COMPILER_IMAGE} ${ONDEWO_PROTOS_DIR} ${ONDEWO_PROTOS_TARGET_DIR}
-	rm -rf ${PROTO_INPUT_DIR}
+	test -f ${PROTO_OUTPUT_DIR}/src/api/mod.rs
+	rm -rf src/api crate-dist
+	cp -R ${PROTO_OUTPUT_DIR}/. ./
+	rm -rf ${PROTO_INPUT_DIR} ${PROTO_OUTPUT_DIR}
 	@echo "$(GREEN)[SUCCESS]$(NC) Generated the rust stubs in src/api"
 
 update_cargo_version: ## Update Version in Cargo.toml
 	@perl -0pi -e 's/(\[package\][^\[]*?\nversion = ")[^"]*(")/$${1}${ONDEWO_SIP_VERSION}$${2}/s' Cargo.toml
 	@echo "$(GREEN)[SUCCESS]$(NC) Cargo.toml version set to ${ONDEWO_SIP_VERSION}"
 
+# --locked everywhere, as in CI: a Cargo.lock that does not match Cargo.toml is an error, never a
+# silent rewrite that leaves the release tree dirty.
 cargo_build: ## Compile the crate in release mode
-	cargo build --release
+	${CARGO} build --release --locked
 
 test: ## Run the test suite (--all-targets also compiles examples/)
-	cargo test --all-targets
+	${CARGO} test --all-targets --locked
+
+release_tests: ## The whole gate a release must pass before anything is committed or pushed
+	$(MAKE) test
+	$(MAKE) check_build
+	$(MAKE) cargo_fmt_check
+	$(MAKE) cargo_doc
+	$(MAKE) publish_crate_dry_run
+	$(MAKE) precommit_hooks_run_all_files
 
 coverage: ## Line coverage of the HAND-WRITTEN sources, gated at COVERAGE_MIN_LINES (as in CI)
 # src/api is machine output and tests/ + examples/ are the measuring instrument, so neither
 # belongs in the metric - what remains is exactly the hand-written library surface. The generated
 # stubs are still exercised, by the behavioural tests under tests/.
 	@command -v cargo-llvm-cov >/dev/null 2>&1 || { echo "$(RED)[ERROR]$(NC) cargo-llvm-cov is missing - install it with 'cargo install cargo-llvm-cov --locked'"; exit 1; }
-	cargo llvm-cov --summary-only \
+	cargo llvm-cov --locked --summary-only \
 		--ignore-filename-regex '${COVERAGE_EXCLUDE_REGEX}' \
 		--fail-under-lines ${COVERAGE_MIN_LINES}
 
 cargo_fmt: ## Format the hand-written sources (src/api is generated and never hand-formatted)
-	find src -name "*.rs" -not -path "src/api/*" -exec rustfmt --edition 2021 {} +
+	${RUSTFMT} --edition 2021 `find src tests examples -name "*.rs" -not -path "src/api/*"`
 
-cargo_fmt_check: ## Check the formatting of the hand-written sources without changing them
-	find src -name "*.rs" -not -path "src/api/*" -exec rustfmt --check --edition 2021 {} +
+cargo_fmt_check: ## Check the formatting of the hand-written sources without changing them (as CI does)
+	${RUSTFMT} --check --edition 2021 `find src tests examples -name "*.rs" -not -path "src/api/*"`
 
 cargo_doc: ## Build the crate documentation
-	cargo doc --no-deps
+	${CARGO} doc --no-deps --locked
 
 clean_generated_api: ## Clear the generated stubs in src/api
 	rm -rf src/api
 
 clean: ## Remove cargo build output, the packaged crate and the generation staging directory
-	cargo clean
-	rm -rf crate-dist ${PROTO_INPUT_DIR} build_check.txt
+	${CARGO} clean
+	rm -rf crate-dist ${PROTO_INPUT_DIR} ${PROTO_OUTPUT_DIR} build_check.txt
 
 ########################################################
 #		Submodules
@@ -240,53 +329,134 @@ checkout_defined_submodule_versions: ## Update submodule versions to the pins at
 ########################################################
 #		Release
 
-check_release_credentials: ## Fail loudly when the GitHub credential is unset or still a placeholder
-# Read through the SHELL ($$VAR - this Makefile exports everything), never through make ($(VAR)),
-# so the token is not interpolated into the recipe text and cannot reach the log.
-#
-# GITHUB_GH_TOKEN only: `release` deliberately does not upload to crates.io (release.yml does),
-# so demanding CARGO_REGISTRY_TOKEN here would fail a release for a credential it never uses.
-	@test -n "$$GITHUB_GH_TOKEN" -a "$$GITHUB_GH_TOKEN" != "ENTER_YOUR_TOKEN_HERE" || { echo "$(RED)[ERROR]$(NC) GITHUB_GH_TOKEN is not set - create one at https://github.com/settings/tokens, or run 'make ondewo_release', which reads it from ${DEVOPS_ACCOUNT_GIT}"; exit 1; }
-	@echo "$(GREEN)[SUCCESS]$(NC) GITHUB_GH_TOKEN is set"
-
-release: ## Automate the entire release process
+release: ## Automate the entire release process (run it through `make ondewo_release`)
 	@echo "Start Release"
-# Everything that can be refuted without touching origin is refuted FIRST. Both of these are
-# otherwise only reached by push_to_gh, the last step - after the release branch and the tag have
-# been pushed. A missing token would then leave an immovable tag on origin and `spc` would refuse
-# every retry, because that branch and that tag now exist; an empty notes slice would publish an
-# empty GitHub release instead of failing.
-	make check_release_credentials
-	make check_release_notes
-	make build
-	-make precommit_hooks_run_all_files
-	git status
-	make check_build
-	git add Cargo.toml
-	-git add Cargo.lock
-# src/ carries BOTH the generated stubs (src/api) and every hand-written module beside them.
-	git add src
-	git add Makefile
-	git add README.md
-	git add RELEASE.md
-# tests/ is not packaged, but leaving it out of the release commit means a regression test
-# written alongside a fix never reaches the repository and CI never runs it.
-	-git add tests
-	git add ${ONDEWO_PROTO_COMPILER_DIR}
-	git add ${ONDEWO_SIP_API_DIR}
-	git status
-	-git commit --no-verify -m "PREPARING FOR RELEASE ${ONDEWO_SIP_VERSION}"
+# Everything that can be refuted without touching origin is refuted FIRST, read-only: host tools,
+# version absent everywhere, RELEASE.md section, every credential valid. A failure here leaves no
+# commit, no branch, no tag and nothing on crates.io.
+	$(MAKE) release_preflight
+# Build and the WHOLE suite run before anything is committed or pushed - a red suite must never
+# reach a tag, and the tag push is what publishes to crates.io. Neither sees a credential.
+	${WITHOUT_CREDENTIALS} $(MAKE) build
+	${WITHOUT_CREDENTIALS} $(MAKE) release_tests
+	git add Cargo.toml Cargo.lock src Makefile README.md RELEASE.md tests ${ONDEWO_PROTO_COMPILER_DIR} ${ONDEWO_SIP_API_DIR}
+	git status --short
+# Commit only when something is staged (a re-run after a commit has nothing new); a commit that
+# FAILS with something staged stops the release.
+	git diff --cached --quiet || git commit --no-verify -m "PREPARING FOR RELEASE ${ONDEWO_SIP_VERSION}"
+# crates.io is published by .github/workflows/release.yml FROM THE TAG, so push, release branch and
+# tag come right before the publish step; a second publisher here would race that workflow and
+# the loser would die on "crate version already uploaded".
 	git push
-	make create_release_branch
-	make create_release_tag
-	make push_to_gh
-# The crates.io upload deliberately does NOT happen here. Pushing the tag above starts
-# .github/workflows/release.yml, which publishes with the CARGO_REGISTRY_TOKEN repository secret;
-# a second publisher in this recipe would race it and the loser would die on "crate version
-# already uploaded". `make ondewo_publish_crate` is the manual path for when the workflow cannot
-# run (no secret yet, GitHub Actions unavailable, or a re-publish after a fixed workflow).
-	@echo "$(BLUE)[INFO]$(NC) Tag ${ONDEWO_SIP_VERSION} pushed - .github/workflows/release.yml publishes it to crates.io"
+	$(MAKE) create_release_branch
+	$(MAKE) create_release_tag
+# Wait for the release workflow of the tag to succeed and for crates.io to SERVE the version
+# before anything announces the release.
+	$(MAKE) release_verify_crate
+	$(MAKE) build_gh_release
+	$(MAKE) release_verify
 	@echo "Release Finished"
+
+release_preflight: ## Read-only: fail before anything is built, committed or pushed (tools, version, notes, credentials)
+	@$(LOAD_DEVOPS_CREDENTIALS); $(SUBMAKE) --no-print-directory release_preflight_checks
+
+release_preflight_checks: ## The checks of release_preflight, with the credentials already in the environment
+	$(MAKE) check_host_tools
+	$(MAKE) spc
+	$(MAKE) check_release_notes
+	$(MAKE) check_release_credentials
+	@echo "$(GREEN)[SUCCESS]$(NC) Preflight for ${ONDEWO_SIP_VERSION} passed - nothing has been changed"
+
+check_host_tools: ## The host tools a release needs; cargo, rustfmt, pre-commit and gh fall back to pinned images
+	@for tool in docker make git perl curl; do \
+		command -v $$tool >/dev/null 2>&1 || { echo "$(RED)[ERROR]$(NC) '$$tool' is not on PATH - a release needs docker, make, git, perl and curl on the host"; exit 1; }; \
+	done
+# The tool fallbacks mount this repository into containers, so a credentials clone left here by an
+# older release (it used to be cloned into the repository) must not be sitting in it.
+	@test ! -e ${DEVOPS_ACCOUNT_GIT} || { echo "$(RED)[ERROR]$(NC) ./${DEVOPS_ACCOUNT_GIT} exists - a stale credentials clone inside the repository; delete it"; exit 1; }
+	@docker version >/dev/null 2>&1 || { echo "$(RED)[ERROR]$(NC) the docker daemon is not reachable - the proto compiler (and every tool fallback) runs in docker"; exit 1; }
+	@for tool in cargo rustfmt pre-commit gh; do \
+		if command -v $$tool >/dev/null 2>&1; then echo "$(BLUE)[INFO]$(NC) $$tool: host (`command -v $$tool`)"; \
+		else echo "$(BLUE)[INFO]$(NC) $$tool: not on the host - runs in a pinned docker image"; fi; \
+	done
+	$(MAKE) release_tools_image
+	@echo "$(GREEN)[SUCCESS]$(NC) Every tool the release needs is available"
+
+release_tools_image: ## Build the pinned gh + pre-commit image, only when one of them is missing on the host
+	@if command -v gh >/dev/null 2>&1 && command -v pre-commit >/dev/null 2>&1; then exit 0; fi; \
+	if docker image inspect ${RELEASE_TOOLS_IMAGE} >/dev/null 2>&1; then exit 0; fi; \
+	echo "$(BLUE)[INFO]$(NC) Building ${RELEASE_TOOLS_IMAGE} from Dockerfile.release-tools ..."; \
+	docker build -t ${RELEASE_TOOLS_IMAGE} - < Dockerfile.release-tools
+
+check_release_credentials: ## Read-only: every credential the release uses is present AND valid
+# Read through the SHELL ($$VAR), never through make ($(VAR)), so a token is never interpolated into
+# the recipe text and cannot reach the log; gh gets it as GH_TOKEN for that one call only, so
+# nothing is ever stored in ~/.config/gh.
+#
+# 1. GitHub: the token must be able to PUSH here (branch, tag, release).
+	@test -n "$$GITHUB_GH_TOKEN" -a "$$GITHUB_GH_TOKEN" != "ENTER_YOUR_TOKEN_HERE" || { echo "$(RED)[ERROR]$(NC) GITHUB_GH_TOKEN is not set - create one at https://github.com/settings/tokens, or run 'make ondewo_release', which reads it from ${DEVOPS_ACCOUNT_GIT}"; exit 1; }
+	@push=`GH_TOKEN="$$GITHUB_GH_TOKEN" ${GH} api repos/${GH_REPO_SLUG} --jq .permissions.push 2>/dev/null`; \
+	test "$$push" = "true" || { echo "$(RED)[ERROR]$(NC) GITHUB_GH_TOKEN is invalid or cannot push to ${GH_REPO_SLUG} (gh api did not answer permissions.push=true)"; exit 1; }; \
+	echo "$(GREEN)[SUCCESS]$(NC) GITHUB_GH_TOKEN is valid and can push to ${GH_REPO_SLUG}"
+# 2. crates.io, as the workflow sees it: release.yml publishes with the Actions secret
+#    CARGO_REGISTRY_TOKEN. GitHub never reveals a secret's value, so this proves the secret EXISTS -
+#    not that it is valid. (Listing secrets needs admin rights on the repository.)
+	@names=`GH_TOKEN="$$GITHUB_GH_TOKEN" ${GH} secret list --repo ${GH_REPO_SLUG} --json name --jq '.[].name' 2>/dev/null` \
+		|| { echo "$(RED)[ERROR]$(NC) cannot list the Actions secrets of ${GH_REPO_SLUG} - GITHUB_GH_TOKEN needs admin rights there"; exit 1; }; \
+	printf '%s\n' "$$names" | grep -Fxq CARGO_REGISTRY_TOKEN || { echo "$(RED)[ERROR]$(NC) the Actions secret CARGO_REGISTRY_TOKEN is missing - release.yml could not publish; add it under Settings > Secrets and variables > Actions"; exit 1; }; \
+	echo "$(GREEN)[SUCCESS]$(NC) the Actions secret CARGO_REGISTRY_TOKEN exists"
+# 3. crates.io, the devops token (account_cargo.env, also what ondewo_publish_crate uploads with):
+#    /api/v1/me accepts only browser sessions, so a LIVE API token is answered "this action can only
+#    be performed on the crates.io website", and a revoked or mistyped one "authentication failed".
+#    That proves the token authenticates - not its scopes, and not that it equals the Actions secret.
+#    The header goes to curl on stdin (-H @-), so the token is never on an argv.
+	@if [ -z "$$CARGO_REGISTRY_TOKEN" ] || [ "$$CARGO_REGISTRY_TOKEN" = "ENTER_HERE_YOUR_CARGO_REGISTRY_TOKEN" ]; then \
+		echo "$(YELLOW)[WARN]$(NC) CARGO_REGISTRY_TOKEN is not in the environment - only the Actions secret's presence was checked"; \
+	else \
+		answer=`printf 'Authorization: %s\n' "$$CARGO_REGISTRY_TOKEN" | curl -sS -A "${CRATES_IO_USER_AGENT}" -H @- https://crates.io/api/v1/me`; \
+		case "$$answer" in \
+			*"can only be performed on the crates.io website"*) echo "$(GREEN)[SUCCESS]$(NC) CARGO_REGISTRY_TOKEN authenticates at crates.io";; \
+			*) echo "$(RED)[ERROR]$(NC) crates.io refused CARGO_REGISTRY_TOKEN (revoked or mistyped?) - renew it in ${DEVOPS_ACCOUNT_GIT} and in the Actions secret"; exit 1;; \
+		esac; \
+	fi
+
+release_verify: ## Read-only: the release is complete - tag on origin, non-empty GitHub release, crate served by crates.io
+	@$(LOAD_DEVOPS_CREDENTIALS); $(SUBMAKE) --no-print-directory release_verify_checks
+
+release_verify_checks: ## The checks of release_verify, with the credentials already in the environment
+	@status=0; git ls-remote --exit-code --tags origin "refs/tags/${ONDEWO_SIP_VERSION}" >/dev/null || status=$$?; \
+	test $$status -eq 0 || { echo "$(RED)[ERROR]$(NC) tag ${ONDEWO_SIP_VERSION} is not on origin (git ls-remote exit $$status)"; exit 1; }; \
+	echo "$(GREEN)[SUCCESS]$(NC) tag ${ONDEWO_SIP_VERSION} is on origin"
+	@body=`GH_TOKEN="$$GITHUB_GH_TOKEN" ${GH} release view "${ONDEWO_SIP_VERSION}" --repo ${GH_REPO_SLUG} --json body --jq .body`; \
+	test -n "`printf '%s' "$$body" | tr -d '[:space:]'`" || { echo "$(RED)[ERROR]$(NC) the GitHub release ${ONDEWO_SIP_VERSION} is missing or has an empty body"; exit 1; }; \
+	echo "$(GREEN)[SUCCESS]$(NC) the GitHub release ${ONDEWO_SIP_VERSION} has release notes"
+	$(MAKE) release_verify_crate
+
+release_verify_crate: ## Read-only: wait for the tag's release.yml run to succeed and for crates.io to serve the version
+# The run appears a few seconds after the tag push; for a tag push GitHub reports the tag as the
+# run's branch. `gh run watch --exit-status` returns at once for a finished run.
+	@run_id=""; attempt=0; \
+	while [ $$attempt -lt ${VERIFY_ATTEMPTS} ]; do \
+		attempt=$$((attempt + 1)); \
+		run_id=`GH_TOKEN="$$GITHUB_GH_TOKEN" ${GH} run list --repo ${GH_REPO_SLUG} --workflow release.yml --event push --branch "${ONDEWO_SIP_VERSION}" --limit 1 --json databaseId --jq '.[0].databaseId // empty'`; \
+		test -n "$$run_id" && break; \
+		echo "$(BLUE)[INFO]$(NC) no release.yml run for tag ${ONDEWO_SIP_VERSION} yet ($$attempt/${VERIFY_ATTEMPTS})"; sleep ${VERIFY_INTERVAL_S}; \
+	done; \
+	test -n "$$run_id" || { echo "$(RED)[ERROR]$(NC) release.yml never started for tag ${ONDEWO_SIP_VERSION}"; exit 1; }; \
+	echo "$(BLUE)[INFO]$(NC) watching release.yml run $$run_id"; \
+	GH_TOKEN="$$GITHUB_GH_TOKEN" ${GH} run watch "$$run_id" --repo ${GH_REPO_SLUG} --exit-status --interval ${VERIFY_INTERVAL_S} >/dev/null \
+		|| { echo "$(RED)[ERROR]$(NC) release.yml run $$run_id for tag ${ONDEWO_SIP_VERSION} failed: ${GH_REPO}/actions/runs/$$run_id"; exit 1; }; \
+	echo "$(GREEN)[SUCCESS]$(NC) release.yml run $$run_id succeeded"
+	@attempt=0; \
+	while [ $$attempt -lt ${VERIFY_ATTEMPTS} ]; do \
+		attempt=$$((attempt + 1)); \
+		answer=`curl -fsS -A "${CRATES_IO_USER_AGENT}" "${CRATES_IO_VERSION_URL}" 2>/dev/null` || answer=""; \
+		if printf '%s' "$$answer" | grep -Fq '"num":"${ONDEWO_SIP_VERSION}"' && printf '%s' "$$answer" | grep -Fq '"yanked":false'; then \
+			echo "$(GREEN)[SUCCESS]$(NC) crates.io serves ${CRATE_NAME} ${ONDEWO_SIP_VERSION}"; exit 0; \
+		fi; \
+		echo "$(BLUE)[INFO]$(NC) crates.io does not serve ${CRATE_NAME} ${ONDEWO_SIP_VERSION} yet ($$attempt/${VERIFY_ATTEMPTS})"; sleep ${VERIFY_INTERVAL_S}; \
+	done; \
+	echo "$(RED)[ERROR]$(NC) crates.io still does not serve ${CRATE_NAME} ${ONDEWO_SIP_VERSION}: ${CRATES_IO_VERSION_URL}"; exit 1
 
 create_release_branch: ## Create Release Branch and push it to origin
 	git checkout -b "release/${ONDEWO_SIP_VERSION}"
@@ -299,26 +469,23 @@ create_release_tag: ## Create Release Tag and push it to origin
 ########################################################
 #		GITHUB
 
-push_to_gh: login_to_gh build_gh_release ## Logs into GitHub CLI and Releases
-	@echo 'Released to Github'
+release_notes: ## Print the RELEASE.md section of ONDEWO_SIP_VERSION (exactly what the GitHub release body is)
+	@${RELEASE_NOTES_SLICE}
 
-login_to_gh: check_release_credentials ## Login to Github CLI with Access Token
-	@echo "$$GITHUB_GH_TOKEN" | gh auth login -p ssh --with-token
-
-check_release_notes: ## Assert RELEASE.md carries an entry for ONDEWO_SIP_VERSION
-# `gh release create -n ""` succeeds and publishes an EMPTY release, so an entry that was
-# forgotten - or a heading whose wording drifted away from what CURRENT_RELEASE_NOTES greps for -
-# is otherwise only noticed by whoever reads the release page afterwards.
-	@notes="$(CURRENT_RELEASE_NOTES)"; \
-	if [ -z "$$notes" ]; then \
-		echo "$(RED)[ERROR]$(NC) RELEASE.md has no '## Release ONDEWO SIP Rust Client ${ONDEWO_SIP_VERSION}' entry"; \
+check_release_notes: ## Assert RELEASE.md carries a non-empty section for ONDEWO_SIP_VERSION
+# `gh release create` with empty notes succeeds and publishes an EMPTY release, so an entry that was
+# forgotten - or a heading whose wording drifted away from RELEASE_NOTES_SLICE - is otherwise only
+# noticed by whoever reads the release page afterwards. The heading and the separator do not count.
+	@${RELEASE_NOTES_SLICE} | grep -v -E '^#|^\*{5}' | grep -q '[^[:space:]]' || { \
+		echo "$(RED)[ERROR]$(NC) RELEASE.md has no non-empty '## ${RELEASE_NOTES_HEADING} ${ONDEWO_SIP_VERSION}' section"; \
 		echo "        The GitHub release would be created with empty notes - add the entry first."; \
-		exit 1; \
-	fi; \
-	echo "$(GREEN)[SUCCESS]$(NC) RELEASE.md has release notes for ${ONDEWO_SIP_VERSION}"
+		exit 1; }
+	@echo "$(GREEN)[SUCCESS]$(NC) RELEASE.md has release notes for ${ONDEWO_SIP_VERSION}"
 
-build_gh_release: check_release_notes ## Generate Github Release with CLI
-	gh release create --repo $(GH_REPO) "$(ONDEWO_SIP_VERSION)" -n "$(CURRENT_RELEASE_NOTES)" -t "Release ${ONDEWO_SIP_VERSION}"
+build_gh_release: check_release_notes ## Create the GitHub release (gh authenticates with GITHUB_GH_TOKEN for this call only)
+# The notes go to gh on stdin, so their quotes and backticks never meet a shell.
+	@test -n "$$GITHUB_GH_TOKEN" || { echo "$(RED)[ERROR]$(NC) GITHUB_GH_TOKEN is not set"; exit 1; }
+	${RELEASE_NOTES_SLICE} | GH_TOKEN="$$GITHUB_GH_TOKEN" ${GH} release create "${ONDEWO_SIP_VERSION}" --repo ${GH_REPO_SLUG} --verify-tag --notes-file - -t "Release ${ONDEWO_SIP_VERSION}"
 
 ########################################################
 #		CRATES.IO
@@ -347,11 +514,11 @@ publish_crate_dry_run: check_crate_metadata ## Credential-free run of the whole 
 # always packages the file named by `readme`, even against an exclude entry, and
 # check_crate_metadata has already proven that file exists and is non-empty.
 	@echo "$(BLUE)[INFO]$(NC) Files that would be published:"
-	cargo package --list --allow-dirty
+	${CARGO} package --list --allow-dirty --locked
 # `cargo publish --dry-run` builds its tarball in a scratch directory and does not leave it behind,
 # so the size limit is measured on the one `cargo package` writes. --no-verify keeps this step to
 # the tarball alone (seconds); the compile that proves the packaged copy builds is the dry run below.
-	cargo package --no-verify --allow-dirty
+	${CARGO} package --no-verify --allow-dirty --locked
 # Name the tarball from the manifest rather than globbing target/package: a cached build directory
 # can still hold the .crate of an earlier version, and a glob would happily measure that one.
 	@crate_file="target/package/`sed -n 's|^name = "\(.*\)"|\1|p' Cargo.toml | head -n 1`-`sed -n 's|^version = "\(.*\)"|\1|p' Cargo.toml | head -n 1`.crate"; \
@@ -359,55 +526,87 @@ publish_crate_dry_run: check_crate_metadata ## Credential-free run of the whole 
 		crate_bytes=`wc -c < "$$crate_file" | tr -d ' '`; \
 		test "$$crate_bytes" -le ${CRATE_MAX_BYTES} || { echo "$(RED)[ERROR]$(NC) $$crate_file is $$crate_bytes bytes, over the crates.io limit of ${CRATE_MAX_BYTES} - trim Cargo.toml's exclude list"; exit 1; }; \
 		echo "$(GREEN)[SUCCESS]$(NC) $$crate_file is $$crate_bytes bytes (crates.io limit: ${CRATE_MAX_BYTES})"
-	cargo publish --dry-run --allow-dirty
+	${CARGO} publish --dry-run --allow-dirty --locked
 
 publish_crate: check_crate_metadata ## Publish the crate to crates.io (needs CARGO_REGISTRY_TOKEN)
-# cargo reads CARGO_REGISTRY_TOKEN from the environment (this Makefile exports it), so the token
+# cargo reads CARGO_REGISTRY_TOKEN from the environment it was started with, so the token
 # never appears on a command line or in the build log. The guard below reads it through the SHELL
 # ($$VAR), not through make ($(VAR)), so the token is not interpolated into the recipe text either.
 	@test -n "$$CARGO_REGISTRY_TOKEN" -a "$$CARGO_REGISTRY_TOKEN" != "ENTER_HERE_YOUR_CARGO_REGISTRY_TOKEN" || { echo "$(RED)[ERROR]$(NC) CARGO_REGISTRY_TOKEN is not set - create one at https://crates.io/settings/tokens, or run 'make ondewo_publish_crate' to take it from the devops-accounts repo"; exit 1; }
 	@echo "$(BLUE)[INFO]$(NC) Publishing ondewo-sip-client ${ONDEWO_SIP_VERSION} to crates.io ..."
-	cargo publish
+	${CARGO_PUBLISH} publish --locked
 	@echo "$(GREEN)[SUCCESS]$(NC) Published to crates.io"
 
 package_crate: ## Package the crate locally (the same artifact `make publish_crate` uploads)
-	cargo package
+	${CARGO} package --locked
 
 ########################################################
 #		DEVOPS-ACCOUNTS
 
-ondewo_release: spc clone_devops_accounts run_release_with_devops ## Release with credentials from devops-accounts repo
-	@rm -rf ${DEVOPS_ACCOUNT_GIT}
+# One shell, so the credentials exist only in that shell's environment and the clone is gone
+# BEFORE `$(MAKE) release` starts: spc first (no credentials needed), then load, then delete. The
+# EXIT/INT/TERM trap deletes our clone on every failure path too. The clone lives in a fresh
+# `mktemp -d` outside this repository, so no docker mount or build context can ever contain it.
+# Anchored greps, exported with `set -a` into the environment (never `make release NAME=<value>`,
+# which would put the token on make's argv, visible to every user in /proc/<pid>/cmdline).
+ondewo_release: spc ## Release with credentials from devops-accounts repo (honours DEVOPS_ACCOUNT_DIR)
+	@set -eu; \
+	owned=""; \
+	if [ -n "${DEVOPS_ACCOUNT_DIR}" ] && [ -d "${DEVOPS_ACCOUNT_DIR}" ]; then \
+		accounts="${DEVOPS_ACCOUNT_DIR}"; \
+		echo "$(BLUE)[INFO]$(NC) Using the devops accounts in DEVOPS_ACCOUNT_DIR (owned by the caller, not deleted here)"; \
+	else \
+		owned=`mktemp -d`; \
+		trap 'rm -rf "$$owned"' EXIT INT TERM; \
+		accounts="$$owned/${DEVOPS_ACCOUNT_GIT}"; \
+		git clone --quiet --depth 1 ${DEVOPS_ACCOUNT_REPO} "$$accounts"; \
+	fi; \
+	set -a; \
+	eval "`grep -h -E '^GITHUB_GH_TOKEN=' "$$accounts/account_github.env"`"; \
+	if [ -f "$$accounts/account_cargo.env" ]; then eval "`grep -h -E '^CARGO_REGISTRY_TOKEN=' "$$accounts/account_cargo.env"`"; fi; \
+	set +a; \
+	if [ -n "$$owned" ]; then rm -rf "$$owned"; echo "$(BLUE)[INFO]$(NC) Deleted the devops-accounts clone"; fi; \
+	$(SUBMAKE) release
 
-ondewo_publish_crate: clone_devops_accounts run_publish_crate_with_devops ## Publish to crates.io with the token from the devops-accounts repo
-	@rm -rf ${DEVOPS_ACCOUNT_GIT}
+ondewo_publish_crate: ## Manual crates.io fallback: publish with the token from the devops-accounts repo (honours DEVOPS_ACCOUNT_DIR)
+	@set -eu; \
+	owned=""; \
+	if [ -n "${DEVOPS_ACCOUNT_DIR}" ] && [ -d "${DEVOPS_ACCOUNT_DIR}" ]; then \
+		accounts="${DEVOPS_ACCOUNT_DIR}"; \
+	else \
+		owned=`mktemp -d`; \
+		trap 'rm -rf "$$owned"' EXIT INT TERM; \
+		accounts="$$owned/${DEVOPS_ACCOUNT_GIT}"; \
+		git clone --quiet --depth 1 ${DEVOPS_ACCOUNT_REPO} "$$accounts"; \
+	fi; \
+	set -a; \
+	eval "`grep -h -E '^CARGO_REGISTRY_TOKEN=' "$$accounts/account_cargo.env"`"; \
+	set +a; \
+	if [ -n "$$owned" ]; then rm -rf "$$owned"; echo "$(BLUE)[INFO]$(NC) Deleted the devops-accounts clone"; fi; \
+	$(SUBMAKE) publish_crate
 
-clone_devops_accounts: ## Clones devops-accounts repo
-	if [ -d $(DEVOPS_ACCOUNT_GIT) ]; then rm -Rf $(DEVOPS_ACCOUNT_GIT); fi
-	git clone git@bitbucket.org:ondewo/${DEVOPS_ACCOUNT_GIT}.git
-
-run_release_with_devops: ## Gets Credentials from devops-repo and run release command with them
-# Only the GitHub token: `release` no longer uploads to crates.io (the release workflow does), so
-# requiring account_cargo.env here would fail a release for a credential it does not use.
-# Anchored grep, exported into the sub-make's ENVIRONMENT: `make release NAME=<value>` would put
-# the token on make's argv, which /proc/<pid>/cmdline shows to every user on the host.
-	@set -a \
-		&& eval "$$(grep -h -E '^(GITHUB_GH_TOKEN)=' ${DEVOPS_ACCOUNT_DIR}/account_github.env)" \
-		&& set +a \
-		&& make release
-
-run_publish_crate_with_devops: ## Gets the crates.io token from the devops-repo and runs the publish with it
-# Anchored grep, exported into the sub-make's ENVIRONMENT, so the token reaches neither make's
-# argv nor the log; cargo reads CARGO_REGISTRY_TOKEN from the environment.
-	@set -a \
-		&& eval "$$(grep -h -E '^(CARGO_REGISTRY_TOKEN)=' ${DEVOPS_ACCOUNT_DIR}/account_cargo.env)" \
-		&& set +a \
-		&& make publish_crate
-
-spc: ## Checks if the Release Branch, Tag and crate version already exist
-	$(eval filtered_branches:= $(shell git branch --all | grep "release/${ONDEWO_SIP_VERSION}"))
-	$(eval filtered_tags:= $(shell git tag --list | grep "${ONDEWO_SIP_VERSION}"))
-	$(eval cargo_version:= $(shell sed -n 's|^version = "\(.*\)"|\1|p' Cargo.toml | head -n 1))
-	@if test "$(filtered_branches)" != ""; then echo "-- Test 1: Branch exists!!" & exit 1; else echo "-- Test 1: Branch is fine";fi
-	@if test "$(filtered_tags)" != ""; then echo "-- Test 2: Tag exists!!" & exit 1; else echo "-- Test 2: Tag is fine";fi
-	@if test "$(cargo_version)" != "${ONDEWO_SIP_VERSION}"; then echo "-- Test 3: Cargo.toml not updated!!" & exit 1; else echo "-- Test 3: Cargo.toml is fine";fi
+spc: ## Refuse a version that already exists: release branch or tag (origin and local), or the crate version on crates.io
+# Anchored, exact ref names: `git ls-remote --exit-code` exits 2 when the ref is absent, 0 when it
+# exists and anything else when origin could not be asked - which is an error, not a pass.
+	@status=0; git ls-remote --exit-code --heads origin "refs/heads/release/${ONDEWO_SIP_VERSION}" >/dev/null || status=$$?; \
+	case $$status in \
+		0) echo "-- Test 1: Branch release/${ONDEWO_SIP_VERSION} exists on origin!!"; exit 1;; \
+		2) ;; \
+		*) echo "-- Test 1: cannot list the branches of origin (git ls-remote exit $$status)"; exit 1;; \
+	esac; \
+	if git rev-parse -q --verify "refs/heads/release/${ONDEWO_SIP_VERSION}" >/dev/null; then echo "-- Test 1: Branch release/${ONDEWO_SIP_VERSION} exists locally!!"; exit 1; fi; \
+	echo "-- Test 1: Branch is fine"
+	@status=0; git ls-remote --exit-code --tags origin "refs/tags/${ONDEWO_SIP_VERSION}" >/dev/null || status=$$?; \
+	case $$status in \
+		0) echo "-- Test 2: Tag ${ONDEWO_SIP_VERSION} exists on origin!!"; exit 1;; \
+		2) ;; \
+		*) echo "-- Test 2: cannot list the tags of origin (git ls-remote exit $$status)"; exit 1;; \
+	esac; \
+	if git rev-parse -q --verify "refs/tags/${ONDEWO_SIP_VERSION}" >/dev/null; then echo "-- Test 2: Tag ${ONDEWO_SIP_VERSION} exists locally!!"; exit 1; fi; \
+	echo "-- Test 2: Tag is fine"
+	@code=`curl -sS -o /dev/null -w '%{http_code}' -A "${CRATES_IO_USER_AGENT}" "${CRATES_IO_VERSION_URL}"` || code=error; \
+	case $$code in \
+		404) echo "-- Test 3: ${CRATE_NAME} ${ONDEWO_SIP_VERSION} is not on crates.io yet";; \
+		200) echo "-- Test 3: ${CRATE_NAME} ${ONDEWO_SIP_VERSION} is already on crates.io!!"; exit 1;; \
+		*) echo "-- Test 3: cannot ask crates.io about ${CRATE_NAME} ${ONDEWO_SIP_VERSION} (HTTP $$code)"; exit 1;; \
+	esac

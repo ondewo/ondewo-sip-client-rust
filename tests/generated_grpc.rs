@@ -22,9 +22,13 @@
 //! Every RPC of `ondewo.sip.Sip` is unary except `SipStreamCallAudio`, a bidirectional stream;
 //! it has its own case below that drives both directions of the stream over the socket.
 //!
+//! `tests/api_surface.rs` checks the stubs against the protos.
+//!
 //! No network beyond `127.0.0.1` and no ONDEWO server is involved.
 
-use std::collections::HashMap;
+mod common;
+
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -478,6 +482,29 @@ async fn every_declared_service_method_exists_and_is_routable() {
         .sip_stream_call_audio(tokio_stream::empty::<sip::SipCallAudioRequest>())
         .await
         .expect("SipStreamCallAudio");
+
+    // Compared with the methods DERIVED from the generated code: an rpc that a new API release
+    // adds fails here until it is called above.
+    let called: BTreeSet<String> = [
+        "sip_start_session",
+        "sip_end_session",
+        "sip_start_call",
+        "sip_end_call",
+        "sip_transfer_call",
+        "sip_register_account",
+        "sip_get_sip_status",
+        "sip_get_sip_status_history",
+        "sip_play_wav_files",
+        "sip_mute",
+        "sip_un_mute",
+        "sip_report_answering_machine_detected",
+        "sip_set_call_media_control",
+        "sip_stream_call_audio",
+    ]
+    .iter()
+    .map(|method| method.to_string())
+    .collect();
+    assert_eq!(called, common::generated_methods("Sip"));
 }
 
 /// The answering machine detection result is a nested message with repeated and enum fields; it

@@ -8,8 +8,10 @@ crate-dist/
 *.crate
 
 # Staging directory that `make generate_ondewo_protos` feeds to the compiler image as
-# /input-volume; it is removed again when generation succeeds.
+# /input-volume, and the one it mounts as /output-volume; both are removed again when generation
+# succeeds.
 .proto-input/
+.proto-output/
 
 # Scratch file of `make check_build`
 build_check.txt

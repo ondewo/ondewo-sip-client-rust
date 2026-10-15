@@ -1,0 +1,11 @@
+# Nothing in this repository is built with it as a docker context today (the compiler image is
+# built from ondewo-proto-compiler/rust, the release tools image from stdin). This keeps it that
+# way should a `docker build .` ever be added: no credentials, no git history, no build output.
+ondewo-devops-accounts
+.git
+target
+crate-dist
+.proto-input
+.proto-output
+ondewo-proto-compiler
+ondewo-sip-api

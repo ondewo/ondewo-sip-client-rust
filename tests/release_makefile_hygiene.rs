@@ -71,7 +71,8 @@ fn makefile_leaks(makefile: &str) -> Vec<String> {
                 "{number}: $(info) carries make-grepped credentials onto a command line"
             ));
         }
-        let starts_make: bool = line.contains("make ") || line.contains("$(MAKE)");
+        let starts_make: bool =
+            line.contains("make ") || line.contains("$(MAKE)") || line.contains("$(SUBMAKE)");
         let reads_credentials: bool =
             line.contains(".env") || SECRETS.iter().any(|secret| line.contains(secret));
         if line.contains("$(shell") && reads_credentials {
@@ -114,7 +115,12 @@ fn argv_flag_leaks(text: &str) -> Vec<String> {
                 "{number}: `cargo login <token>` passes the token on the argv"
             ));
         }
-        if line.contains("Authorization:") && SECRETS.iter().any(|secret| line.contains(secret)) {
+        // `printf 'Authorization: %s' "$$TOKEN" | curl -H @-` hands the header to curl on stdin
+        // (printf is a shell builtin), which is the one safe way to send it.
+        if line.contains("Authorization:")
+            && SECRETS.iter().any(|secret| line.contains(secret))
+            && !line.contains("-H @-")
+        {
             leaks.push(format!(
                 "{number}: an Authorization header with a credential on the argv"
             ));
@@ -157,15 +163,18 @@ fn workflow_leaks(workflow: &str) -> Vec<String> {
     leaks
 }
 
-fn run_release_with_devops_recipe(makefile: &str) -> String {
-    makefile
-        .split("\nrun_release_with_devops:")
-        .nth(1)
-        .expect("the Makefile defines run_release_with_devops")
-        .split("\n\n")
-        .next()
-        .unwrap_or_default()
-        .to_string()
+/// The recipe of `target`: its tab-indented lines plus the column-0 comments between them.
+fn recipe(makefile: &str, target: &str) -> String {
+    let header: String = format!("\n{target}:");
+    let start: usize = makefile
+        .find(&header)
+        .unwrap_or_else(|| panic!("the Makefile defines {target}"));
+    makefile[start + 1..]
+        .lines()
+        .skip(1)
+        .take_while(|line| line.starts_with('\t') || line.starts_with('#'))
+        .collect::<Vec<&str>>()
+        .join("\n")
 }
 
 #[test]
@@ -175,16 +184,55 @@ fn makefile_recipes_never_put_a_credential_on_a_command_line() {
 
 #[test]
 fn the_devops_release_hands_the_credentials_over_the_environment() {
-    let recipe: String = run_release_with_devops_recipe(MAKEFILE);
+    let recipe: String = recipe(MAKEFILE, "ondewo_release");
     assert!(
         recipe.contains("set -a"),
         "the credentials must be exported into the sub-make's environment"
     );
-    assert!(
-        recipe.contains("'^("),
-        "the devops .env files must be read with an anchored grep"
-    );
+    for secret in ["GITHUB_GH_TOKEN", "CARGO_REGISTRY_TOKEN"] {
+        assert!(
+            recipe.contains(&format!("grep -h -E '^{secret}='")),
+            "the devops .env files must be read with an anchored grep for {secret}"
+        );
+    }
     assert!(!recipe.contains("$(info)"));
+    assert!(
+        !recipe.contains("make release ")
+            && !recipe.contains("$(MAKE) release ")
+            && !recipe.contains("$(SUBMAKE) release "),
+        "nothing may follow `release` on the sub-make's argv"
+    );
+}
+
+/// No bare `export` (it would hand every variable, tokens included, to cargo, its build scripts,
+/// the test binaries and the pre-commit hooks), and the build and test steps of a release run with
+/// the credentials removed from their environment.
+#[test]
+fn credentials_reach_only_the_steps_that_use_them() {
+    assert!(
+        !MAKEFILE
+            .lines()
+            .any(|line| line.trim() == "export" || line.starts_with("export ")),
+        "a bare export leaks every variable into every recipe"
+    );
+    let without: &str = MAKEFILE
+        .lines()
+        .find_map(|line| line.strip_prefix("WITHOUT_CREDENTIALS="))
+        .expect("the Makefile defines WITHOUT_CREDENTIALS");
+    for secret in SECRETS.iter().chain(["GH_TOKEN", "GITHUB_TOKEN"].iter()) {
+        assert!(without.contains(&format!("-u {secret}")), "{secret}");
+    }
+    let release: String = recipe(MAKEFILE, "release");
+    for step in ["$(MAKE) build", "$(MAKE) release_tests"] {
+        assert!(
+            release.contains(&format!("${{WITHOUT_CREDENTIALS}} {step}")),
+            "`{step}` must run without the credentials"
+        );
+    }
+    assert!(
+        !MAKEFILE.contains("gh auth login"),
+        "gh gets GH_TOKEN per call; a login would persist the token in ~/.config/gh"
+    );
 }
 
 #[test]
@@ -255,15 +303,20 @@ fn the_checks_catch_the_old_leaks() {
             "{expected} not caught in {leaks:?}"
         );
     }
-    assert!(!run_release_with_devops_recipe(old_makefile).contains("set -a"));
+    assert!(!recipe(old_makefile, "run_release_with_devops").contains("set -a"));
 
     let old_workflow: &str = "    steps:\n      - name: publish\n        run: |\n          cargo publish\n          echo ${{ secrets.CARGO_REGISTRY_TOKEN }} | x\n      - run: x ${{ secrets.A }}\n";
     assert_eq!(workflow_leaks(old_workflow).len(), 2);
 
     let fine: &str = "\t@echo \"$(if $(filter-out P,$(GITHUB_GH_TOKEN)),<set>,<unset>)\"\n\
         \t@echo \"$$GITHUB_GH_TOKEN\" | gh auth login -p ssh --with-token\n\
-        \t@docker run --rm -e CARGO_REGISTRY_TOKEN image\n";
+        \t@docker run --rm -e CARGO_REGISTRY_TOKEN image\n\
+        \t@printf 'Authorization: %s' \"$$CARGO_REGISTRY_TOKEN\" | curl -H @- https://x\n";
     assert_eq!(makefile_leaks(fine), Vec::<String>::new());
+    assert_eq!(
+        argv_flag_leaks("curl -H \"Authorization: $CARGO_REGISTRY_TOKEN\" https://x").len(),
+        1
+    );
     let fine_workflow: &str =
         "      - name: publish\n        env:\n          T: ${{ secrets.T }}\n        run: make publish_crate\n";
     assert_eq!(workflow_leaks(fine_workflow), Vec::<String>::new());

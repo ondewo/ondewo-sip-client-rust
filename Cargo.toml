@@ -33,7 +33,9 @@ exclude = [
   "ondewo-proto-compiler/",
   "crate-dist/",
   ".proto-input/",
+  ".proto-output/",
   ".github/",
+  ".dockerignore",
 ]
 
 [lib]

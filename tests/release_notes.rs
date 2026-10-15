@@ -12,33 +12,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The GitHub release body is sliced out of RELEASE.md by the Makefile's `CURRENT_RELEASE_NOTES`.
+//! The GitHub release body is the RELEASE.md section that `make release_notes` prints.
 //!
-//! The slice starts at `Release ONDEWO SIP Rust Client <version>` and ends at the next
-//! `*****` line. A heading spelled any other way gives an empty slice, and `gh release create -n ""`
-//! then publishes a release without notes and without an error; a range that ended at the first
-//! `**` instead would cut the notes at their first bold span.
+//! The slice starts at the heading `## Release ONDEWO SIP Rust Client <version>` - matched
+//! EXACTLY, so `9.1.1` never selects the section of `9.1.10` - and ends at the next `*****` line.
+//! A heading spelled any other way gives an empty slice, which `check_release_notes` refuses
+//! before anything is pushed; a range that ended at the first `**` instead would cut the notes at
+//! their first bold span. These tests run the Makefile's own slice through make and perl rather
+//! than a re-implementation of it.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 const RELEASE_NOTES: &str = include_str!("../RELEASE.md");
 const MAKEFILE: &str = include_str!("../Makefile");
 const HEADING_PREFIX: &str = "## Release ONDEWO SIP Rust Client ";
 
-fn is_separator(line: &str) -> bool {
-    line.starts_with("*****")
+fn root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Reproduce the Makefile's perl range `/Release ONDEWO SIP Rust Client <v>/../^\*{5}/`.
-fn release_notes_slice(version: &str) -> Vec<&'static str> {
-    let lines: Vec<&str> = RELEASE_NOTES.lines().collect();
-    let needle = format!("Release ONDEWO SIP Rust Client {version}");
-    let start = lines
-        .iter()
-        .position(|line| line.contains(&needle))
-        .unwrap_or_else(|| panic!("RELEASE.md has no '{needle}' heading"));
-    let end = (start + 1..lines.len())
-        .find(|&index| is_separator(lines[index]))
-        .unwrap_or_else(|| panic!("the section of {version} does not end at a ***** separator"));
-    lines[start..=end].to_vec()
+/// Run `make -s <target> ONDEWO_SIP_VERSION=<version> RELEASE_NOTES_FILE=<file>`.
+fn make(target: &str, version: &str, notes_file: &Path) -> Output {
+    Command::new("make")
+        .current_dir(root())
+        // A `make release` that runs this suite must not hand its own flags (-n, a jobserver)
+        // to the make started here.
+        .env_remove("MAKEFLAGS")
+        .env_remove("MAKELEVEL")
+        .env_remove("MFLAGS")
+        .args(["-s", "--no-print-directory", target])
+        .arg(format!("ONDEWO_SIP_VERSION={version}"))
+        .arg(format!("RELEASE_NOTES_FILE={}", notes_file.display()))
+        .output()
+        .expect("make is on PATH")
+}
+
+fn release_notes_of(version: &str, notes_file: &Path) -> String {
+    let output: Output = make("release_notes", version, notes_file);
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout).expect("the notes are UTF-8")
 }
 
 fn headings() -> Vec<&'static str> {
@@ -52,12 +65,68 @@ fn version_of(heading: &str) -> &str {
     heading.strip_prefix(HEADING_PREFIX).unwrap()
 }
 
+fn fixture(name: &str, text: &str) -> PathBuf {
+    let directory: PathBuf = root().join("target").join("release-notes-fixtures");
+    std::fs::create_dir_all(&directory).expect("target/ is writable");
+    let path: PathBuf = directory.join(name);
+    std::fs::write(&path, text).expect("the fixture is writable");
+    path
+}
+
 #[test]
-fn the_makefile_slices_the_heading_this_test_checks() {
-    assert!(MAKEFILE.contains(
-        "perl -ne 'print if /Release ONDEWO SIP Rust Client ${ONDEWO_SIP_VERSION}/../^\\*{5}/'"
-    ));
-    assert!(MAKEFILE.contains("-n \"$(CURRENT_RELEASE_NOTES)\""));
+fn the_slice_is_anchored_and_stops_at_its_separator() {
+    let slice: &str = MAKEFILE
+        .lines()
+        .find_map(|line| line.strip_prefix("RELEASE_NOTES_SLICE="))
+        .expect("the Makefile defines RELEASE_NOTES_SLICE");
+    assert!(slice.contains(r"/^\x23+ ${RELEASE_NOTES_HEADING} \Q${ONDEWO_SIP_VERSION}\E$$/"));
+    assert!(slice.contains(r"exit if /^\*{5}/"));
+    assert!(MAKEFILE.contains("--notes-file -"));
+}
+
+#[test]
+fn a_version_never_selects_the_section_of_a_longer_one() {
+    let notes: PathBuf = fixture(
+        "prefix.md",
+        "# Release History\n\n*****************\n\n\
+         ## Release ONDEWO SIP Rust Client 9.1.10\n\n* ten\n\n*****************\n\n\
+         ## Release ONDEWO SIP Rust Client 9.1.1\n\n* one, see **9.1.10** too\n\n\
+         *****************\n\n\
+         ## Release ONDEWO SIP Rust Client 9.1.1\n\n* a later mention must not restart the slice\n\n\
+         *****************\n",
+    );
+    let one: String = release_notes_of("9.1.1", &notes);
+    assert!(
+        one.starts_with("## Release ONDEWO SIP Rust Client 9.1.1\n"),
+        "{one}"
+    );
+    assert!(one.contains("* one, see **9.1.10** too"), "{one}");
+    assert!(!one.contains("* ten"), "{one}");
+    assert!(!one.contains("later mention"), "{one}");
+    let ten: String = release_notes_of("9.1.10", &notes);
+    assert!(ten.contains("* ten") && !ten.contains("* one"), "{ten}");
+    // A dot is a dot: 9x1x1 is not 9.1.1.
+    assert_eq!(release_notes_of("9x1x1", &notes), "");
+    assert_eq!(release_notes_of("9.1", &notes), "");
+    assert!(!make("check_release_notes", "9.1", &notes).status.success());
+    assert!(make("check_release_notes", "9.1.1", &notes)
+        .status
+        .success());
+}
+
+#[test]
+fn a_heading_without_notes_is_refused() {
+    let notes: PathBuf = fixture(
+        "empty.md",
+        "## Release ONDEWO SIP Rust Client 1.2.3\n\n\n*****************\n",
+    );
+    assert_eq!(
+        release_notes_of("1.2.3", &notes).lines().next(),
+        Some("## Release ONDEWO SIP Rust Client 1.2.3")
+    );
+    assert!(!make("check_release_notes", "1.2.3", &notes)
+        .status
+        .success());
 }
 
 #[test]
@@ -85,19 +154,22 @@ fn every_release_heading_uses_the_spelling_the_makefile_slices() {
 
 #[test]
 fn every_section_ends_at_its_separator_and_holds_only_its_own_notes() {
+    let release_md: PathBuf = root().join("RELEASE.md");
     for heading in headings() {
-        let slice = release_notes_slice(version_of(heading));
-        assert_eq!(slice[0], heading);
-        assert!(is_separator(slice[slice.len() - 1]));
+        let slice: String = release_notes_of(version_of(heading), &release_md);
+        let lines: Vec<&str> = slice.lines().collect();
+        assert_eq!(lines[0], heading);
+        assert!(lines[lines.len() - 1].starts_with("*****"), "{heading}");
         assert!(
-            slice[1..].iter().all(|line| !line.starts_with("## ")),
+            lines[1..].iter().all(|line| !line.starts_with("## ")),
             "the section of {heading:?} runs into the next one"
         );
-        let body: Vec<&&str> = slice[1..slice.len() - 1]
-            .iter()
-            .filter(|line| !line.trim().is_empty())
-            .collect();
-        assert!(!body.is_empty(), "the section of {heading:?} is empty");
+        assert!(
+            make("check_release_notes", version_of(heading), &release_md)
+                .status
+                .success(),
+            "the section of {heading:?} is empty"
+        );
     }
 }
 
@@ -108,10 +180,6 @@ fn the_current_version_has_non_empty_release_notes() {
         .find_map(|line| line.strip_prefix("ONDEWO_SIP_VERSION="))
         .expect("the Makefile sets ONDEWO_SIP_VERSION")
         .trim();
-    let slice = release_notes_slice(version);
-    let body: Vec<&&str> = slice[1..slice.len() - 1]
-        .iter()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    assert!(body.len() > 1, "{version}: {body:?}");
+    let output: Output = make("check_release_notes", version, &root().join("RELEASE.md"));
+    assert!(output.status.success(), "{version}: {output:?}");
 }
