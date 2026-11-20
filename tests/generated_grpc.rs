@@ -222,6 +222,18 @@ impl Sip for FakeSip {
         }))
     }
 
+    async fn sip_send_dtmf(
+        &self,
+        request: Request<sip::SipSendDtmfRequest>,
+    ) -> Result<Response<sip::SipStatus>, Status> {
+        self.record(&request);
+        let sent = request.into_inner().digits.len();
+        Ok(Response::new(sip::SipStatus {
+            description: format!("sent {sent} dtmf keys"),
+            ..status_of(StatusType::OutgoingCallConnected)
+        }))
+    }
+
     async fn sip_mute(&self, request: Request<()>) -> Result<Response<sip::SipStatus>, Status> {
         self.record(&request);
         Ok(Response::new(status_of(StatusType::MicrophoneMuted)))
@@ -462,6 +474,10 @@ async fn every_declared_service_method_exists_and_is_routable() {
         .sip_play_wav_files(sip::SipPlayWavFilesRequest::default())
         .await
         .expect("SipPlayWavFiles");
+    client
+        .sip_send_dtmf(sip::SipSendDtmfRequest::default())
+        .await
+        .expect("SipSendDtmf");
     client.sip_mute(()).await.expect("SipMute");
     client.sip_un_mute(()).await.expect("SipUnMute");
     client
@@ -495,6 +511,7 @@ async fn every_declared_service_method_exists_and_is_routable() {
         "sip_get_sip_status",
         "sip_get_sip_status_history",
         "sip_play_wav_files",
+        "sip_send_dtmf",
         "sip_mute",
         "sip_un_mute",
         "sip_report_answering_machine_detected",
@@ -550,10 +567,11 @@ async fn the_call_scope_metadatum_reaches_the_server() {
         bot_listening: sip::MediaControlSetting::On as i32,
         owner: sip::MediaControlOwner::Operator as i32,
         participants_present: false,
+        warm_transfer_outcome: None,
     };
 
     let unscoped = client
-        .sip_set_call_media_control(control)
+        .sip_set_call_media_control(control.clone())
         .await
         .expect_err("the fake server refuses a request without the call scope");
     assert_eq!(unscoped.code(), Code::FailedPrecondition);

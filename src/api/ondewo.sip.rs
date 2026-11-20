@@ -330,6 +330,46 @@ pub struct SipTransferCallRequest {
     /// answer, unreachable) the caller is lost. Validate targets up front, or use a WARM transfer.</p>
     #[prost(uint32, tag="3")]
     pub outcome_timeout_ms: u32,
+    /// <p>Optional. Claims the transfer parked in <code>SipStatus.delegated_transfer</code> (see
+    /// <code>SipTransferDelegation</code>). <code>SIP_TRANSFER_DELEGATION_UNSPECIFIED</code> (default): an ordinary
+    /// transfer, exactly as before this field existed.</p>
+    #[prost(enumeration="SipTransferDelegation", tag="4")]
+    pub delegation: i32,
+    /// <p>Required with every <code>delegation</code> other than <code>SIP_TRANSFER_DELEGATION_UNSPECIFIED</code>, ignored
+    /// otherwise: must equal <code>SipStatus.delegated_transfer.request_id</code> of the parked transfer, otherwise the
+    /// request is refused with <code>exception_name=DelegatedRequestMismatch</code> and nothing is sent. Empty (default):
+    /// no delegated transfer is claimed.</p>
+    #[prost(string, tag="5")]
+    pub delegated_request_id: ::prost::alloc::string::String,
+}
+/// <p>A transfer that the in-container speech-to-speech pipeline asked for and the container handed to a client instead
+/// of sending it (see <code>SipTransferDelegation</code>). Call-scoped: empty when no transfer is parked, when no call
+/// is ongoing, and after the call ended.</p>
+/// <p><code>SipGetSipStatus</code>, <code>SipGetSipStatusHistory</code> and every other response report only
+/// <code>request_id</code>, <code>requested_at</code> and <code>target_is_phone_number</code>. The target and the headers
+/// are filled ONLY in the response of a <code>SIP_TRANSFER_DELEGATION_CLAIM</code>.</p>
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SipDelegatedTransfer {
+    /// Identifier of the parked transfer, a UUID minted by ONDEWO SIP. Sent back as
+    /// <code>SipTransferCallRequest.delegated_request_id</code>. Empty when no transfer is parked
+    #[prost(string, tag="1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// When the pipeline asked for the transfer
+    #[prost(message, optional, tag="2")]
+    pub requested_at: ::core::option::Option<::prost_types::Timestamp>,
+    /// <code>true</code> when the target is a phone number by the transfer target policy of ONDEWO SIP (a leading
+    /// <code>+</code> followed by digits, or a trunk-routed number), <code>false</code> for an account name such as a
+    /// softphone
+    #[prost(bool, tag="3")]
+    pub target_is_phone_number: bool,
+    /// The target the pipeline asked for, already checked by the transfer target policy. Only in the response of a
+    /// <code>SIP_TRANSFER_DELEGATION_CLAIM</code>, empty everywhere else
+    #[prost(string, tag="4")]
+    pub transfer_id: ::prost::alloc::string::String,
+    /// The headers the pipeline sent with the transfer. Only in the response of a
+    /// <code>SIP_TRANSFER_DELEGATION_CLAIM</code>, empty everywhere else
+    #[prost(map="string, string", tag="5")]
+    pub headers: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 /// <p>Status information for a SIP account, session, or call</p>
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -392,6 +432,26 @@ pub struct SipStatus {
     /// otherwise, <code>0</code> when unknown). Call-scoped
     #[prost(int32, tag="16")]
     pub sip_response_code: i32,
+    /// The transfer parked for a client to claim (see <code>SipTransferDelegation</code>). Unset (empty) when no transfer
+    /// is parked, which is always the case in a container started without <code>SIP_TRANSFER_DELEGATION_ACTIVE=True</code>.
+    /// Call-scoped
+    #[prost(message, optional, tag="17")]
+    pub delegated_transfer: ::core::option::Option<SipDelegatedTransfer>,
+    /// <p>Optional features this container supports, as stable tokens. Fixed for the life of the container, so it is the
+    /// same on every status. Empty (default): none of them, as for a container built before this field existed. Clients
+    /// ignore tokens they do not know.</p>
+    /// <ul>
+    ///    <li><code>warm-transfer-outcome-notice</code>: <code>SipSetCallMediaControlRequest.warm_transfer_outcome</code>
+    ///    is handed to the speech-to-speech pipeline, and the pipeline tells the caller.</li>
+    /// </ul>
+    #[prost(string, repeated, tag="18")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Answer of the speech-to-speech pipeline to the <code>warm_transfer_outcome</code> notice of a
+    /// <code>SipSetCallMediaControl</code> request. Only in the response of that request;
+    /// <code>SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_UNSPECIFIED</code> everywhere else and when the request carried no
+    /// notice
+    #[prost(enumeration="SipWarmTransferOutcomeNoticeStatus", tag="19")]
+    pub warm_transfer_outcome_notice_status: i32,
 }
 /// Nested message and enum types in `SipStatus`.
 pub mod sip_status {
@@ -524,7 +584,7 @@ pub struct SipStatusHistoryResponse {
     pub status_history: ::prost::alloc::vec::Vec<SipStatus>,
 }
 /// <p>Request of <code>SipSetCallMediaControl</code></p>
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SipSetCallMediaControlRequest {
     /// <code>MEDIA_CONTROL_SETTING_ON</code>: the bot speaks. <code>MEDIA_CONTROL_SETTING_OFF</code>: the bot is muted
     #[prost(enumeration="MediaControlSetting", tag="1")]
@@ -546,6 +606,53 @@ pub struct SipSetCallMediaControlRequest {
     /// nothing. Cleared when the call ends</p>
     #[prost(bool, tag="4")]
     pub participants_present: bool,
+    /// <p>Optional, only with <code>MEDIA_CONTROL_OWNER_PARTICIPANT</code> (any other owner, an outcome other than
+    /// <code>SIP_WARM_TRANSFER_OUTCOME_DECLINED</code> / <code>SIP_WARM_TRANSFER_OUTCOME_UNREACHABLE</code>, or an empty
+    /// <code>request_id</code> is refused with <code>exception_name=InvalidWarmTransferOutcomeNotice</code> and changes
+    /// nothing). The outcome of a warm transfer that the bot must tell the caller, sent with the request that releases
+    /// the participant hold, so the bot speaks only once it can.</p>
+    /// <p>Handed to the speech-to-speech pipeline after the level, also when the level did not change; the answer is
+    /// returned in <code>SipStatus.warm_transfer_outcome_notice_status</code>. A notice the pipeline did not answer is
+    /// kept and handed over again until it answers, and dropped when the call ends. Unset (default): no notice, exactly
+    /// as before this field existed.</p>
+    #[prost(message, optional, tag="5")]
+    pub warm_transfer_outcome: ::core::option::Option<SipWarmTransferOutcomeNotice>,
+}
+/// <p>One-shot notice of a warm-transfer outcome for the bot. The pipeline tells the caller at most once per
+/// <code>request_id</code> and call. Carries no reason text the target gave</p>
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SipWarmTransferOutcomeNotice {
+    /// Identifier of the transfer request of the client (ONDEWO VTSI). Required; the notice is delivered at most once
+    /// per call for one identifier
+    #[prost(string, tag="1")]
+    pub request_id: ::prost::alloc::string::String,
+    /// The outcome
+    #[prost(enumeration="SipWarmTransferOutcome", tag="2")]
+    pub outcome: i32,
+    /// Optional: NLU session name of the session in which the transfer target was introduced, so the pipeline can
+    /// relay what the target said. Empty when there was no intro
+    #[prost(string, tag="3")]
+    pub intro_session: ::prost::alloc::string::String,
+    /// Optional: display name of the transfer target, at most 128 characters
+    #[prost(string, tag="4")]
+    pub callee_display_name: ::prost::alloc::string::String,
+    /// Optional: a stable token naming why the transfer did not complete, e.g. <code>target-hung-up</code>,
+    /// <code>target-refused</code>, <code>voicemail-suspected</code>. Never free text
+    #[prost(string, tag="5")]
+    pub cause: ::prost::alloc::string::String,
+    /// Optional: the sentence the pipeline speaks itself when it cannot have the NLU phrase the outcome, rendered by the
+    /// client. Never contains a reason the target gave. Empty: the pipeline has no sentence of its own to fall back on
+    #[prost(string, tag="6")]
+    pub fallback_text: ::prost::alloc::string::String,
+}
+/// <p>Request of <code>SipSendDtmf</code></p>
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SipSendDtmfRequest {
+    /// The keys to send, in order: <code>0</code>-<code>9</code>, <code>*</code>, <code>#</code>,
+    /// <code>A</code>-<code>D</code>; at most 64. Any other character refuses the request (<code>InvalidDtmf</code>)
+    /// and sends nothing
+    #[prost(string, tag="1")]
+    pub digits: ::prost::alloc::string::String,
 }
 /// <p>Configuration of a <code>SipStreamCallAudio</code> stream. Must be the first request of the stream</p>
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -682,6 +789,58 @@ pub struct SipPlayWavFilesRequest {
     #[prost(bytes="vec", repeated, tag="1")]
     pub wav_files: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
+/// <p>How a <code>SipTransferCall</code> handles a transfer that the container parked in
+/// <code>SipStatus.delegated_transfer</code> instead of sending it.</p>
+/// <p>Every value other than <code>SIP_TRANSFER_DELEGATION_UNSPECIFIED</code> requires the
+/// <code>x-ondewo-sip-call-control-token</code> metadatum (otherwise <code>CallControlUnauthenticated</code>) and the
+/// <code>x-ondewo-expected-call-id</code> metadatum naming the ongoing call (missing or different:
+/// <code>CallScopeMismatch</code>), plus <code>delegated_request_id</code> (otherwise
+/// <code>DelegatedRequestMismatch</code>). Refusals are RETURNED in <code>exception_name</code> /
+/// <code>description</code> and never assigned to the shared status.</p>
+/// <p>A parked transfer that is neither claimed nor ended within <code>SIP_TRANSFER_DELEGATION_CLAIM_TIMEOUT_S</code> is
+/// dropped WITHOUT a REFER, and the pipeline is told with <code>SIP_WARM_TRANSFER_OUTCOME_DELEGATION_EXPIRED</code>. A
+/// claimed transfer never expires.</p>
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SipTransferDelegation {
+    /// No delegated transfer is claimed: the request is an ordinary transfer, exactly as before this field existed
+    Unspecified = 0,
+    /// Claim the parked transfer and send nothing. The response carries the full target and headers in
+    /// <code>SipStatus.delegated_transfer.transfer_id</code> / <code>headers</code>, and the parked transfer no longer
+    /// expires. It stays parked until <code>SIP_TRANSFER_DELEGATION_EXECUTE</code>, <code>SIP_TRANSFER_DELEGATION_DISCARD</code>
+    /// or the end of the call. A repeated claim answers the same
+    Claim = 1,
+    /// End the delegation and send the transfer of THIS request (<code>transfer_id</code>, <code>headers</code>,
+    /// <code>outcome_timeout_ms</code>) as an ordinary <code>SipTransferCall</code>, with the same outcomes and refusals
+    Execute = 2,
+    /// End the delegation and send nothing; the call stays with the bot, e.g. because the client handles the transfer
+    /// itself (a warm transfer with an intro)
+    Discard = 3,
+}
+impl SipTransferDelegation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SIP_TRANSFER_DELEGATION_UNSPECIFIED",
+            Self::Claim => "SIP_TRANSFER_DELEGATION_CLAIM",
+            Self::Execute => "SIP_TRANSFER_DELEGATION_EXECUTE",
+            Self::Discard => "SIP_TRANSFER_DELEGATION_DISCARD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SIP_TRANSFER_DELEGATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "SIP_TRANSFER_DELEGATION_CLAIM" => Some(Self::Claim),
+            "SIP_TRANSFER_DELEGATION_EXECUTE" => Some(Self::Execute),
+            "SIP_TRANSFER_DELEGATION_DISCARD" => Some(Self::Discard),
+            _ => None,
+        }
+    }
+}
 /// <p>Desired setting of one media control flag</p>
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -747,6 +906,91 @@ impl MediaControlOwner {
             "MEDIA_CONTROL_OWNER_UNSPECIFIED" => Some(Self::Unspecified),
             "MEDIA_CONTROL_OWNER_OPERATOR" => Some(Self::Operator),
             "MEDIA_CONTROL_OWNER_PARTICIPANT" => Some(Self::Participant),
+            _ => None,
+        }
+    }
+}
+/// <p>Outcome of a warm transfer that the bot tells the caller</p>
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SipWarmTransferOutcome {
+    /// No outcome
+    Unspecified = 0,
+    /// The transfer target declined the call; the caller stays with the bot
+    Declined = 1,
+    /// The transfer target could not be reached: busy, no answer, no decision, or no intro possible; the caller stays
+    /// with the bot
+    Unreachable = 2,
+    /// A transfer parked in <code>SipStatus.delegated_transfer</code> was not claimed in time and was dropped without a
+    /// REFER. Set by ONDEWO SIP itself towards the pipeline, never accepted from a client
+    DelegationExpired = 3,
+}
+impl SipWarmTransferOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SIP_WARM_TRANSFER_OUTCOME_UNSPECIFIED",
+            Self::Declined => "SIP_WARM_TRANSFER_OUTCOME_DECLINED",
+            Self::Unreachable => "SIP_WARM_TRANSFER_OUTCOME_UNREACHABLE",
+            Self::DelegationExpired => "SIP_WARM_TRANSFER_OUTCOME_DELEGATION_EXPIRED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SIP_WARM_TRANSFER_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+            "SIP_WARM_TRANSFER_OUTCOME_DECLINED" => Some(Self::Declined),
+            "SIP_WARM_TRANSFER_OUTCOME_UNREACHABLE" => Some(Self::Unreachable),
+            "SIP_WARM_TRANSFER_OUTCOME_DELEGATION_EXPIRED" => Some(Self::DelegationExpired),
+            _ => None,
+        }
+    }
+}
+/// <p>Answer of the speech-to-speech pipeline to a <code>SipWarmTransferOutcomeNotice</code></p>
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SipWarmTransferOutcomeNoticeStatus {
+    /// No notice was carried
+    Unspecified = 0,
+    /// The pipeline accepted the notice and will tell the caller, unless the call ends first
+    Queued = 1,
+    /// The pipeline already has a notice with this <code>request_id</code> on this call; nothing new is told
+    Duplicate = 2,
+    /// The pipeline does not tell the caller about warm-transfer outcomes (switched off); the notice is dropped
+    Disabled = 3,
+    /// The pipeline refused the notice as malformed; the notice is dropped
+    Invalid = 4,
+    /// The pipeline did not answer (unreachable, or an older pipeline without the notice). The notice is kept and handed
+    /// over again until it answers or the call ends
+    Pending = 5,
+}
+impl SipWarmTransferOutcomeNoticeStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_UNSPECIFIED",
+            Self::Queued => "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_QUEUED",
+            Self::Duplicate => "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_DUPLICATE",
+            Self::Disabled => "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_DISABLED",
+            Self::Invalid => "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_INVALID",
+            Self::Pending => "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_PENDING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_QUEUED" => Some(Self::Queued),
+            "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_DUPLICATE" => Some(Self::Duplicate),
+            "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_DISABLED" => Some(Self::Disabled),
+            "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_INVALID" => Some(Self::Invalid),
+            "SIP_WARM_TRANSFER_OUTCOME_NOTICE_STATUS_PENDING" => Some(Self::Pending),
             _ => None,
         }
     }

@@ -65,6 +65,7 @@ fn sample_status() -> sip::SipStatus {
         listening_paused: true,
         call_audio_streams: 2,
         sip_response_code: 202,
+        ..Default::default()
     }
 }
 
